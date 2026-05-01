@@ -675,29 +675,26 @@ async def get_recaptcha_v3_token() -> Optional[str]:
             if not lib_ready:
                 _m().debug_print("  ⚠️ Library not found. Injecting reCAPTCHA scripts...")
                 # Inject reCAPTCHA scripts since LMArena may not have them loaded
-                await _m().safe_page_evaluate(
-                    page,
-                    """() => {
+                inject_script = f"""() => {{
                         const w = window.wrappedJSObject || window;
                         if (w.__LM_BRIDGE_RECAPTCHA_INJECTED) return true;
                         w.__LM_BRIDGE_RECAPTCHA_INJECTED = true;
                         const h = w.document?.head;
                         if (!h) return false;
                         const urls = [
-                            'https://www.google.com/recaptcha/enterprise.js?render=' + encodeURIComponent(recaptcha_sitekey),
-                            'https://www.google.com/recaptcha/api.js?render=' + encodeURIComponent(recaptcha_sitekey),
+                            'https://www.google.com/recaptcha/enterprise.js?render=' + encodeURIComponent('{recaptcha_sitekey}'),
+                            'https://www.google.com/recaptcha/api.js?render=' + encodeURIComponent('{recaptcha_sitekey}'),
                         ];
-                        for (const u of urls) {
+                        for (const u of urls) {{
                             const s = w.document.createElement('script');
                             s.src = u;
                             s.async = true;
                             s.defer = true;
                             h.appendChild(s);
-                        }
+                        }}
                         return true;
-                    }""",
-                    recaptcha_sitekey=recaptcha_sitekey,
-                )
+                    }}"""
+                await _m().safe_page_evaluate(page, inject_script)
                 # Wait for scripts to load
                 await asyncio.sleep(5)
                 lib_ready = await _m().safe_page_evaluate(
