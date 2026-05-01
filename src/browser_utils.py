@@ -3,7 +3,7 @@ Browser and OS window utility functions for LMArenaBridge.
 
 Handles:
 - Windows OS window hiding/minimizing (ctypes, no extra deps)
-- Camoufox/Playwright page window mode application
+- CloakBrowser/Playwright page window mode application
 - Cloudflare Turnstile clicking
 - Safe page evaluation with retry logic
 - Async task lifecycle helpers
@@ -19,7 +19,7 @@ def _is_windows() -> bool:
     return os.name == "nt" or sys.platform == "win32"
 
 
-def _normalize_camoufox_window_mode(value: object) -> str:
+def _normalize_cloakbrowser_window_mode(value: object) -> str:
     mode = str(value or "").strip().lower()
     if mode in ("hide", "hidden"):
         return "hide"
@@ -40,7 +40,7 @@ def _windows_apply_window_mode_by_title_substring(title_substring: str, mode: st
         return False
     if not isinstance(title_substring, str) or not title_substring.strip():
         return False
-    normalized_mode = _normalize_camoufox_window_mode(mode)
+    normalized_mode = _normalize_cloakbrowser_window_mode(mode)
     if normalized_mode == "visible":
         return False
 
@@ -170,7 +170,7 @@ def _windows_apply_window_mode_by_title_substring(title_substring: str, mode: st
     return bool(matched["any"])
 
 
-async def _maybe_apply_camoufox_window_mode(
+async def _maybe_apply_cloakbrowser_window_mode(
     page,
     config: dict,
     *,
@@ -192,7 +192,7 @@ async def _maybe_apply_camoufox_window_mode(
     if not _main._is_windows():
         return
     cfg = config or {}
-    mode = _normalize_camoufox_window_mode(cfg.get(mode_key))
+    mode = _normalize_cloakbrowser_window_mode(cfg.get(mode_key))
     if mode == "visible":
         return
 

@@ -256,8 +256,8 @@ def get_general_backoff_seconds(attempt: int) -> int:
 # ============================================================
 
 # Default browser window modes
-DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE = "hide"
-DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE = "hide"
+DEFAULT_CLOAKBROWSER_PROXY_WINDOW_MODE = "hide"
+DEFAULT_CLOAKBROWSER_FETCH_WINDOW_MODE = "hide"
 DEFAULT_CHROME_FETCH_WINDOW_MODE = "hide"
 
 # Window mode valid values

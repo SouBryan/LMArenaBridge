@@ -19,7 +19,11 @@ from datetime import datetime, timezone, timedelta
 from urllib.parse import urlsplit, urlparse, parse_qs
 
 import uvicorn
-from camoufox.async_api import AsyncCamoufox
+from cloakbrowser import (
+    launch_async as cloakbrowser_launch_async,
+    launch_context_async as cloakbrowser_launch_context_async,
+    launch_persistent_context_async as cloakbrowser_launch_persistent_context_async,
+)
 from fastapi import FastAPI, HTTPException, Depends, status, Form, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import HTMLResponse, RedirectResponse, StreamingResponse
@@ -28,6 +32,8 @@ from fastapi.security import APIKeyHeader
 import httpx
 import requests
 
+AsyncCamoufox = None  # DEPRECATED: será removido após migração completa
+
 # Import from modularized modules
 from . import constants
 from . import config as _config_module
@@ -35,9 +41,9 @@ from . import state as _state_module
 from .config import get_models, save_models
 from .browser_utils import (
     _is_windows,
-    _normalize_camoufox_window_mode,
+    _normalize_cloakbrowser_window_mode,
     _windows_apply_window_mode_by_title_substring,
-    _maybe_apply_camoufox_window_mode,
+    _maybe_apply_cloakbrowser_window_mode,
     click_turnstile,
     is_execution_context_destroyed_error,
     safe_page_evaluate,
@@ -48,6 +54,7 @@ from .recaptcha import (
     extract_recaptcha_params_from_text,
     get_recaptcha_settings,
     _mint_recaptcha_v3_token_in_page,
+    _cloakbrowser_proxy_signup_anonymous_user,
     _camoufox_proxy_signup_anonymous_user,
     _set_provisional_user_id_in_browser,
     _maybe_inject_arena_auth_cookie_from_localstorage,
@@ -101,7 +108,7 @@ from .transport import (
     fetch_lmarena_stream_via_camoufox,
     fetch_via_proxy_queue,
     push_proxy_chunk,
-    camoufox_proxy_worker,
+    cloakbrowser_proxy_worker,
 )
 
 # Aliases for backward compatibility
@@ -131,8 +138,8 @@ DEFAULT_USERSCRIPT_PROXY_POLL_TIMEOUT_SECONDS = constants.DEFAULT_USERSCRIPT_PRO
 DEFAULT_USERSCRIPT_PROXY_JOB_TTL_SECONDS = constants.DEFAULT_USERSCRIPT_PROXY_JOB_TTL_SECONDS
 USERSCRIPT_PROXY_ACTIVE_WINDOW_BUFFER_SECONDS = constants.USERSCRIPT_PROXY_ACTIVE_WINDOW_BUFFER_SECONDS
 USERSCRIPT_PROXY_JOB_TTL_MAX_SECONDS = constants.USERSCRIPT_PROXY_JOB_TTL_MAX_SECONDS
-DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE = constants.DEFAULT_CAMOUFOX_PROXY_WINDOW_MODE
-DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE = constants.DEFAULT_CAMOUFOX_FETCH_WINDOW_MODE
+DEFAULT_CLOAKBROWSER_PROXY_WINDOW_MODE = constants.DEFAULT_CLOAKBROWSER_PROXY_WINDOW_MODE
+DEFAULT_CLOAKBROWSER_FETCH_WINDOW_MODE = constants.DEFAULT_CLOAKBROWSER_FETCH_WINDOW_MODE
 DEFAULT_CHROME_FETCH_WINDOW_MODE = constants.DEFAULT_CHROME_FETCH_WINDOW_MODE
 VALID_WINDOW_MODES = constants.VALID_WINDOW_MODES
 CHROME_PATH_CANDIDATES = constants.CHROME_PATH_CANDIDATES
@@ -247,7 +254,7 @@ STREAM_CREATE_EVALUATION_PATH = "/nextjs-api/stream/create-evaluation"
 # LMArena occasionally changes the reCAPTCHA sitekey/action. We try to discover them from captured JS chunks on startup
 # and persist them into config.json; these helpers read and apply those values with safe fallbacks.
 
-# _is_windows, _normalize_camoufox_window_mode imported from browser_utils
+# _is_windows, _normalize_cloakbrowser_window_mode imported from browser_utils
 
 
 USERSCRIPT_PROXY_LAST_POLL_AT: float = 0.0
@@ -803,7 +810,8 @@ async def rate_limit_api_key(key: str = Depends(API_KEY_HEADER)):
 async def get_initial_data():
     debug_print("Starting initial data retrieval...")
     try:
-        async with AsyncCamoufox(headless=True, main_world_eval=True) as browser:
+        browser = await cloakbrowser_launch_async(headless=True)
+        try:
             page = await browser.new_page()
             
             # Set up route interceptor BEFORE navigating
@@ -901,7 +909,7 @@ async def get_initial_data():
                 user_agent = None
 
             config = get_config()
-            # Prefer keeping an existing UA (often set by Chrome contexts) instead of overwriting with Camoufox UA.
+            # Prefer keeping an existing UA (often set by Chrome contexts) instead of overwriting with CloakBrowser UA.
             ua_for_config = None
             if not normalize_user_agent_value(config.get("user_agent")):
                 ua_for_config = user_agent
@@ -1035,6 +1043,8 @@ async def get_initial_data():
                 pass
 
             debug_print("✅ Initial data retrieval complete")
+        finally:
+            await browser.close()
     except Exception as e:
         debug_print(f"❌ An error occurred during initial data retrieval: {e}")
 
@@ -1105,7 +1115,7 @@ async def startup_event():
         last_userscript_poll = now
         USERSCRIPT_PROXY_LAST_POLL_AT = now
         
-        asyncio.create_task(camoufox_proxy_worker())
+        asyncio.create_task(cloakbrowser_proxy_worker())
         
     except Exception as e:
         debug_print(f"❌ Error during startup: {e}")

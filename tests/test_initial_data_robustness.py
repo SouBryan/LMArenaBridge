@@ -1,10 +1,9 @@
 import unittest
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import AsyncMock, patch
 import asyncio
 
 class TestInitialDataRobustness(unittest.IsolatedAsyncioTestCase):
     async def test_get_initial_data_retries_cloudflare(self):
-        # We need to mock Camoufox and the page
         from src import main
         
         mock_page = AsyncMock()
@@ -23,9 +22,9 @@ class TestInitialDataRobustness(unittest.IsolatedAsyncioTestCase):
         
         mock_browser = AsyncMock()
         mock_browser.new_page.return_value = mock_page
-        mock_browser.__aenter__.return_value = mock_browser
+        mock_browser.close = AsyncMock()
         
-        with patch("src.main.AsyncCamoufox", return_value=mock_browser), \
+        with patch("src.main.cloakbrowser_launch_async", return_value=mock_browser), \
              patch("src.main.click_turnstile", AsyncMock(return_value=True)) as mock_click, \
              patch("src.main.get_config", return_value={}), \
              patch("src.main.save_config"), \

@@ -1,7 +1,6 @@
 fastapi
 uvicorn
-camoufox
-playwright
+cloakbrowser
 httpx
 cloudscraper
 python-multipart

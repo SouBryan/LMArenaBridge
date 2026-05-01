@@ -2,8 +2,8 @@
 Transport layer for LMArenaBridge.
 
 Contains the stream response classes, arena origin/cookie utilities, and the three fetch
-transport implementations (userscript proxy, Chrome/Playwright, Camoufox), plus the
-Camoufox proxy worker and push_proxy_chunk helper.
+transport implementations (userscript proxy, Chrome-style persistent context, CloakBrowser), plus the
+CloakBrowser proxy worker and push_proxy_chunk helper.
 
 Cross-module globals (from main.py) are accessed via _m() late-import so test patches
 on main.X remain effective.
@@ -477,7 +477,15 @@ async def _get_arena_context_cookies(context, *, page_url: Optional[str] = None)
     Fetch cookies for both arena.ai and lmarena.ai from a Playwright/Camoufox browser context.
     """
     urls = _arena_origin_candidates(page_url)
-    all_raw: list[dict] = []
+    try:
+        cookies = await context.cookies(urls)
+        if isinstance(cookies, list):
+            return cookies
+    except Exception:
+        pass
+
+    merged: list[dict] = []
+    seen: set[tuple[str, str, str]] = set()
     for url in urls:
         try:
             chunk = await context.cookies(url)
@@ -591,18 +599,9 @@ async def fetch_lmarena_stream_via_chrome(
     max_recaptcha_attempts: int = 3,
 ) -> Optional[BrowserFetchStreamResponse]:
     """
-    Fallback transport: perform the stream request via in-browser fetch (Chrome/Edge via Playwright).
+    Fallback transport: perform the stream request via in-browser fetch using a persistent Chrome-style context.
     This tends to align cookies/UA/TLS with what LMArena expects and can reduce reCAPTCHA flakiness.
     """
-    try:
-        from playwright.async_api import async_playwright  # type: ignore
-    except Exception:
-        return None
-
-    chrome_path = _m().find_chrome_executable()
-    if not chrome_path:
-        return None
-
     config = _m().get_config()
     recaptcha_sitekey, recaptcha_action = _m().get_recaptcha_settings(config)
 
@@ -656,449 +655,431 @@ async def fetch_lmarena_stream_via_chrome(
             return False
         return isinstance(body, dict) and body.get("error") == "recaptcha validation failed"
 
-    max_recaptcha_attempts = max(1, min(int(max_recaptcha_attempts), 10))
-
     profile_dir = Path(_m().CONFIG_FILE).with_name("chrome_grecaptcha")
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            executable_path=chrome_path,
-            headless=bool(headless),
-            user_agent=user_agent or None,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        )
-        try:
-            # Small stealth tweak: reduces bot-detection surface for reCAPTCHA v3 scoring.
+    context = await _m().cloakbrowser_launch_persistent_context_async(
+        str(profile_dir),
+        headless=bool(headless),
+    )
+    try:
+        if desired_cookies:
             try:
-                await context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                )
-            except Exception:
-                pass
-
-            if desired_cookies:
+                existing_names: set[str] = set()
                 try:
-                    existing_names: set[str] = set()
-                    try:
-                        existing = await _get_arena_context_cookies(context)
-                        for c in existing or []:
-                            name = c.get("name")
-                            if name:
-                                existing_names.add(str(name))
-                    except Exception:
-                        existing_names = set()
+                    existing = await _get_arena_context_cookies(context)
+                    for c in existing or []:
+                        name = c.get("name")
+                        if name:
+                            existing_names.add(str(name))
+                except Exception:
+                    existing_names = set()
 
-                    cookies_to_add: list[dict] = []
-                    for c in desired_cookies:
-                        name = str(c.get("name") or "")
-                        if not name:
-                            continue
-                        # Always ensure the auth cookie matches the selected upstream token.
-                        if name == "arena-auth-prod-v1":
-                            cookies_to_add.append(c)
-                            continue
-
-                        # Do NOT overwrite/inject Cloudflare or reCAPTCHA cookies in the persistent profile.
-                        # The profile manages these itself; injecting stale ones from config causes 403s.
-                        if name in ("cf_clearance", "__cf_bm", "_GRECAPTCHA"):
-                            continue
-
-                        # Avoid overwriting existing Cloudflare/session cookies in the persistent profile.
-                        if name in existing_names:
-                            continue
+                cookies_to_add: list[dict] = []
+                for c in desired_cookies:
+                    name = str(c.get("name") or "")
+                    if not name:
+                        continue
+                    # Always ensure the auth cookie matches the selected upstream token.
+                    if name == "arena-auth-prod-v1":
                         cookies_to_add.append(c)
+                        continue
 
-                    if cookies_to_add:
-                        await context.add_cookies(cookies_to_add)
-                except Exception:
-                    pass
+                    # Do NOT overwrite/inject Cloudflare or reCAPTCHA cookies in the persistent profile.
+                    # The profile manages these itself; injecting stale ones from config causes 403s.
+                    if name in ("cf_clearance", "__cf_bm", "_GRECAPTCHA"):
+                        continue
 
-            page = await context.new_page()
-            await _m()._maybe_apply_camoufox_window_mode(
-                page,
-                config,
-                mode_key="chrome_fetch_window_mode",
-                marker="LMArenaBridge Chrome Fetch",
-                headless=bool(headless),
+                    # Avoid overwriting existing Cloudflare/session cookies in the persistent profile.
+                    if name in existing_names:
+                        continue
+                    cookies_to_add.append(c)
+
+                if cookies_to_add:
+                    await context.add_cookies(cookies_to_add)
+            except Exception:
+                pass
+
+        page = await context.new_page()
+        await _m()._maybe_apply_cloakbrowser_window_mode(
+            page,
+            config,
+            mode_key="chrome_fetch_window_mode",
+            marker="LMArenaBridge Chrome Fetch",
+            headless=bool(headless),
+        )
+        await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+
+        # Best-effort: if we land on a Cloudflare challenge page, try clicking Turnstile before minting tokens.
+        try:
+            for i in range(10): # Up to 30 seconds
+                title = await page.title()
+                if "Just a moment" not in title:
+                    break
+                _m().debug_print(f"  ⏳ Waiting for Cloudflare challenge in Chrome... (attempt {i+1}/10)")
+                await _m().click_turnstile(page)
+                await asyncio.sleep(3)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=15000)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # Light warm-up (often improves reCAPTCHA v3 score vs firing immediately).
+        try:
+            await page.mouse.move(100, 100)
+            await asyncio.sleep(0.5)
+            await page.mouse.wheel(0, 200)
+            await asyncio.sleep(1)
+            await page.mouse.move(200, 300)
+            await asyncio.sleep(0.5)
+            await page.mouse.wheel(0, 300)
+            await asyncio.sleep(2) # Reduced "Human" pause for faster response
+        except Exception:
+            pass
+
+        # Persist updated cookies/UA from this browser context (helps keep auth + cf cookies fresh).
+        try:
+            fresh_cookies = await _get_arena_context_cookies(context, page_url=str(getattr(page, "url", "") or ""))
+            _m()._capture_ephemeral_arena_auth_token_from_cookies(fresh_cookies)
+            try:
+                ua_now = await page.evaluate("() => navigator.userAgent")
+            except Exception:
+                ua_now = user_agent
+            if _m()._upsert_browser_session_into_config(config, fresh_cookies, user_agent=ua_now):
+                _m().save_config(config)
+        except Exception:
+            pass
+
+        async def _mint_recaptcha_v3_token() -> Optional[str]:
+            await page.wait_for_function(
+                "window.grecaptcha && ("
+                "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
+                "typeof window.grecaptcha.execute === 'function'"
+                ")",
+                timeout=60000,
             )
-            await page.goto("https://arena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+            token = await page.evaluate(
+                """({sitekey, action}) => new Promise((resolve, reject) => {
+                  const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
+                    ? window.grecaptcha.enterprise
+                    : window.grecaptcha;
+                  if (!g || typeof g.execute !== 'function') return reject('NO_GRECAPTCHA');
+                  try {
+                    g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
+                  } catch (e) { reject(String(e)); }
+                })""",
+                {"sitekey": recaptcha_sitekey, "action": recaptcha_action},
+            )
+            if isinstance(token, str) and token:
+                return token
+            return None
 
-            # Best-effort: if we land on a Cloudflare challenge page, try clicking Turnstile before minting tokens.
+        async def _mint_recaptcha_v2_token() -> Optional[str]:
+            """
+            Best-effort: try to obtain a reCAPTCHA Enterprise v2 token (checkbox/invisible).
+            LMArena falls back to v2 when v3 scoring is rejected.
+            """
             try:
-                for i in range(10): # Up to 30 seconds
-                    title = await page.title()
-                    if "Just a moment" not in title:
-                        break
-                    _m().debug_print(f"  ⏳ Waiting for Cloudflare challenge in Chrome... (attempt {i+1}/10)")
-                    await _m().click_turnstile(page)
-                    await asyncio.sleep(3)
-                try:
-                    await page.wait_for_load_state("domcontentloaded", timeout=15000)
-                except Exception:
-                    pass
-            except Exception:
-                pass
-
-            # Light warm-up (often improves reCAPTCHA v3 score vs firing immediately).
-            try:
-                await page.mouse.move(100, 100)
-                await asyncio.sleep(0.5)
-                await page.mouse.wheel(0, 200)
-                await asyncio.sleep(1)
-                await page.mouse.move(200, 300)
-                await asyncio.sleep(0.5)
-                await page.mouse.wheel(0, 300)
-                await asyncio.sleep(2) # Reduced "Human" pause for faster response
-            except Exception:
-                pass
-
-            # Persist updated cookies/UA from this browser context (helps keep auth + cf cookies fresh).
-            try:
-                fresh_cookies = await _get_arena_context_cookies(context, page_url=str(getattr(page, "url", "") or ""))
-                _m()._capture_ephemeral_arena_auth_token_from_cookies(fresh_cookies)
-                try:
-                    ua_now = await page.evaluate("() => navigator.userAgent")
-                except Exception:
-                    ua_now = user_agent
-                if _m()._upsert_browser_session_into_config(config, fresh_cookies, user_agent=ua_now):
-                    _m().save_config(config)
-            except Exception:
-                pass
-
-            async def _mint_recaptcha_v3_token() -> Optional[str]:
                 await page.wait_for_function(
-                    "window.grecaptcha && ("
-                    "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
-                    "typeof window.grecaptcha.execute === 'function'"
-                    ")",
+                    "window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.render === 'function'",
                     timeout=60000,
                 )
-                token = await page.evaluate(
-                    """({sitekey, action}) => new Promise((resolve, reject) => {
-                      const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
-                        ? window.grecaptcha.enterprise
-                        : window.grecaptcha;
-                      if (!g || typeof g.execute !== 'function') return reject('NO_GRECAPTCHA');
-                      try {
-                        g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
-                      } catch (e) { reject(String(e)); }
-                    })""",
-                    {"sitekey": recaptcha_sitekey, "action": recaptcha_action},
-                )
-                if isinstance(token, str) and token:
-                    return token
+            except Exception:
                 return None
 
-            async def _mint_recaptcha_v2_token() -> Optional[str]:
-                """
-                Best-effort: try to obtain a reCAPTCHA Enterprise v2 token (checkbox/invisible).
-                LMArena falls back to v2 when v3 scoring is rejected.
-                """
-                try:
-                    await page.wait_for_function(
-                        "window.grecaptcha && window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.render === 'function'",
-                        timeout=60000,
-                    )
-                except Exception:
-                    return None
-
-                token = await page.evaluate(
-                    """({sitekey, timeoutMs}) => new Promise((resolve, reject) => {
-                      const g = window.grecaptcha?.enterprise;
-                      if (!g || typeof g.render !== 'function') return reject('NO_GRECAPTCHA_V2');
-                      let settled = false;
-                      const done = (fn, arg) => {
-                        if (settled) return;
-                        settled = true;
-                        fn(arg);
-                      };
-                      try {
-                        const el = document.createElement('div');
-                        el.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;';
-                        document.body.appendChild(el);
-                        const timer = setTimeout(() => done(reject, 'V2_TIMEOUT'), timeoutMs || 60000);
-                        const wid = g.render(el, {
-                          sitekey,
-                          size: 'invisible',
-                          callback: (tok) => { clearTimeout(timer); done(resolve, tok); },
-                          'error-callback': () => { clearTimeout(timer); done(reject, 'V2_ERROR'); },
-                        });
-                        try {
-                          if (typeof g.execute === 'function') g.execute(wid);
-                        } catch (e) {}
-                      } catch (e) {
-                        done(reject, String(e));
-                      }
-                    })""",
-                    {"sitekey": _m().RECAPTCHA_V2_SITEKEY, "timeoutMs": 60000},
-                )
-                if isinstance(token, str) and token:
-                    return token
-                return None
-
-            lines_queue: asyncio.Queue = asyncio.Queue()
-            done_event: asyncio.Event = asyncio.Event()
-
-            # Buffer for splitlines handling in browser
-            async def _report_chunk(source, line: str):
-                if line and line.strip():
-                    await lines_queue.put(line)
-
-            await page.expose_binding("reportChunk", _report_chunk)
-
-            fetch_script = """async ({url, method, body, extraHeaders, timeoutMs}) => {
-              const controller = new AbortController();
-              const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
-              try {
-                const res = await fetch(url, {
-                  method,
-                  headers: { 
-                    'content-type': 'text/plain;charset=UTF-8',
-                    ...extraHeaders
-                  },
-                  body,
-                  credentials: 'include',
-                  signal: controller.signal,
-                });
-                const headers = {};
-                try {
-                  if (res.headers && typeof res.headers.forEach === 'function') {
-                    res.headers.forEach((value, key) => { headers[key] = value; });
+            token = await page.evaluate(
+                """({sitekey, timeoutMs}) => new Promise((resolve, reject) => {
+                  const g = window.grecaptcha?.enterprise;
+                  if (!g || typeof g.render !== 'function') return reject('NO_GRECAPTCHA_V2');
+                  let settled = false;
+                  const done = (fn, arg) => {
+                    if (settled) return;
+                    settled = true;
+                    fn(arg);
+                  };
+                  try {
+                    const el = document.createElement('div');
+                    el.style.cssText = 'position:fixed;left:-9999px;top:-9999px;width:1px;height:1px;';
+                    document.body.appendChild(el);
+                    const timer = setTimeout(() => done(reject, 'V2_TIMEOUT'), timeoutMs || 60000);
+                    const wid = g.render(el, {
+                      sitekey,
+                      size: 'invisible',
+                      callback: (tok) => { clearTimeout(timer); done(resolve, tok); },
+                      'error-callback': () => { clearTimeout(timer); done(reject, 'V2_ERROR'); },
+                    });
+                    try {
+                      if (typeof g.execute === 'function') g.execute(wid);
+                    } catch (e) {}
+                  } catch (e) {
+                    done(reject, String(e));
                   }
-                } catch (e) {}
+                })""",
+                {"sitekey": _m().RECAPTCHA_V2_SITEKEY, "timeoutMs": 60000},
+            )
+            if isinstance(token, str) and token:
+                return token
+            return None
 
-                // Send initial status and headers
-                if (window.reportChunk) {
-                    await window.reportChunk(JSON.stringify({ __type: 'meta', status: res.status, headers }));
-                }
+        lines_queue: asyncio.Queue = asyncio.Queue()
+        done_event: asyncio.Event = asyncio.Event()
 
-                if (res.body) {
-                  const reader = res.body.getReader();
-                  const decoder = new TextDecoder();
-                  let buffer = '';
-                  while (true) {
-                    const { value, done } = await reader.read();
-                    if (value) buffer += decoder.decode(value, { stream: true });
-                    if (done) buffer += decoder.decode();
-                    
-                    const parts = buffer.split(/\\r?\\n/);
-                    buffer = parts.pop() || '';
-                    for (const line of parts) {
-                        if (line.trim() && window.reportChunk) {
-                            await window.reportChunk(line);
-                        }
-                    }
-                    if (done) break;
-                  }
-                  if (buffer.trim() && window.reportChunk) {
-                      await window.reportChunk(buffer);
-                  }
-                } else {
-                  const text = await res.text();
-                  if (window.reportChunk) await window.reportChunk(text);
-                }
-                return { __streaming: true };
-              } catch (e) {
-                return { status: 502, headers: {}, text: 'FETCH_ERROR:' + String(e) };
-              } finally {
-                clearTimeout(timer);
+        # Buffer for splitlines handling in browser
+        async def _report_chunk(source, line: str):
+            if line and line.strip():
+                await lines_queue.put(line)
+
+        await page.expose_binding("reportChunk", _report_chunk)
+
+        fetch_script = """async ({url, method, body, extraHeaders, timeoutMs}) => {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort('timeout'), timeoutMs);
+          try {
+            const res = await fetch(url, {
+              method,
+              headers: { 
+                'content-type': 'text/plain;charset=UTF-8',
+                ...extraHeaders
+              },
+              body,
+              credentials: 'include',
+              signal: controller.signal,
+            });
+            const headers = {};
+            try {
+              if (res.headers && typeof res.headers.forEach === 'function') {
+                res.headers.forEach((value, key) => { headers[key] = value; });
               }
-            }"""
+            } catch (e) {}
 
-            result: dict = {"status": 0, "headers": {}, "text": ""}
-            for attempt in range(max_recaptcha_attempts):
-                # Clear queue for each attempt
-                while not lines_queue.empty():
-                    lines_queue.get_nowait()
-                done_event.clear()
+            // Send initial status and headers
+            if (window.reportChunk) {
+                await window.reportChunk(JSON.stringify({ __type: 'meta', status: res.status, headers }));
+            }
 
-                current_recaptcha_token = ""
-                # Mint a new token if not already present or if it's empty
-                has_v2 = isinstance(payload, dict) and bool(payload.get("recaptchaV2Token"))
-                has_v3 = isinstance(payload, dict) and bool(payload.get("recaptchaV3Token"))
+            if (res.body) {
+              const reader = res.body.getReader();
+              const decoder = new TextDecoder();
+              let buffer = '';
+              while (true) {
+                const { value, done } = await reader.read();
+                if (value) buffer += decoder.decode(value, { stream: true });
+                if (done) buffer += decoder.decode();
                 
-                if isinstance(payload, dict) and not has_v2 and (attempt > 0 or not has_v3):
-                    current_recaptcha_token = await _mint_recaptcha_v3_token()
-                    if current_recaptcha_token:
-                        payload["recaptchaV3Token"] = current_recaptcha_token
+                const parts = buffer.split(/\r?\n/);
+                buffer = parts.pop() || '';
+                for (const line of parts) {
+                    if (line.trim() && window.reportChunk) {
+                        await window.reportChunk(line);
+                    }
+                }
+                if (done) break;
+              }
+              if (buffer.trim() && window.reportChunk) {
+                  await window.reportChunk(buffer);
+              }
+            } else {
+              const text = await res.text();
+              if (window.reportChunk) await window.reportChunk(text);
+            }
+            return { __streaming: true };
+          } catch (e) {
+            return { status: 502, headers: {}, text: 'FETCH_ERROR:' + String(e) };
+          } finally {
+            clearTimeout(timer);
+          }
+        }"""
 
-                extra_headers = {}
-                token_for_headers = current_recaptcha_token
-                if not token_for_headers and isinstance(payload, dict):
-                    token_for_headers = str(payload.get("recaptchaV3Token") or "").strip()
-                if token_for_headers:
-                    extra_headers["X-Recaptcha-Token"] = token_for_headers
-                    extra_headers["X-Recaptcha-Action"] = recaptcha_action
+        result: dict = {"status": 0, "headers": {}, "text": ""}
+        for attempt in range(max_recaptcha_attempts):
+            # Clear queue for each attempt
+            while not lines_queue.empty():
+                lines_queue.get_nowait()
+            done_event.clear()
 
-                body = json.dumps(payload) if payload is not None else ""
-                
-                # Start fetch task
-                fetch_task = asyncio.create_task(page.evaluate(
-                    fetch_script,
-                    {
-                        "url": fetch_url,
-                        "method": http_method,
-                        "body": body,
-                        "extraHeaders": extra_headers,
-                        "timeoutMs": int(timeout_seconds * 1000),
-                    },
-                ))
+            current_recaptcha_token = ""
+            # Mint a new token if not already present or if it's empty
+            has_v2 = isinstance(payload, dict) and bool(payload.get("recaptchaV2Token"))
+            has_v3 = isinstance(payload, dict) and bool(payload.get("recaptchaV3Token"))
+            
+            if isinstance(payload, dict) and not has_v2 and (attempt > 0 or not has_v3):
+                current_recaptcha_token = await _mint_recaptcha_v3_token()
+                if current_recaptcha_token:
+                    payload["recaptchaV3Token"] = current_recaptcha_token
 
-                # Wait for initial meta (status/headers) OR task completion
-                meta = None
-                while not fetch_task.done():
-                    try:
-                        # Peek at queue for meta
-                        item = await asyncio.wait_for(lines_queue.get(), timeout=0.1)
-                        if isinstance(item, str) and item.startswith('{"__type":"meta"'):
-                            meta = json.loads(item)
+            extra_headers = {}
+            token_for_headers = current_recaptcha_token
+            if not token_for_headers and isinstance(payload, dict):
+                token_for_headers = str(payload.get("recaptchaV3Token") or "").strip()
+            if token_for_headers:
+                extra_headers["X-Recaptcha-Token"] = token_for_headers
+                extra_headers["X-Recaptcha-Action"] = recaptcha_action
+
+            body = json.dumps(payload) if payload is not None else ""
+            
+            # Start fetch task
+            fetch_task = asyncio.create_task(page.evaluate(
+                fetch_script,
+                {
+                    "url": fetch_url,
+                    "method": http_method,
+                    "body": body,
+                    "extraHeaders": extra_headers,
+                    "timeoutMs": int(timeout_seconds * 1000),
+                },
+            ))
+
+            # Wait for initial meta (status/headers) OR task completion
+            meta = None
+            while not fetch_task.done():
+                try:
+                    # Peek at queue for meta
+                    item = await asyncio.wait_for(lines_queue.get(), timeout=0.1)
+                    if isinstance(item, str) and item.startswith('{"__type":"meta"'):
+                        meta = json.loads(item)
+                        break
+                    else:
+                        # Not meta, put it back (though it shouldn't happen before meta)
+                        # Actually, LMArena might send data immediately.
+                        # If it's not meta, it's likely already content.
+                        # For safety, let's assume if it doesn't look like meta, status is 200.
+                        if not item.startswith('{"__type":"meta"'):
+                            await lines_queue.put(item)
+                            meta = {"status": 200, "headers": {}}
                             break
-                        else:
-                            # Not meta, put it back (though it shouldn't happen before meta)
-                            # Actually, LMArena might send data immediately.
-                            # If it's not meta, it's likely already content.
-                            # For safety, let's assume if it doesn't look like meta, status is 200.
-                            if not item.startswith('{"__type":"meta"'):
-                                await lines_queue.put(item)
-                                meta = {"status": 200, "headers": {}}
-                                break
-                    except asyncio.TimeoutError:
-                        continue
-                
-                if fetch_task.done() and meta is None:
-                    # Give a brief moment for meta chunk to arrive in the queue (race condition)
-                    try:
-                        # Check if there's anything in the queue that might be the meta chunk
+                except asyncio.TimeoutError:
+                    continue
+            
+            if fetch_task.done() and meta is None:
+                # Give a brief moment for meta chunk to arrive in the queue (race condition)
+                try:
+                    res = fetch_task.result()
+                    if isinstance(res, dict) and not res.get("__streaming"):
+                        result = res
+                    else:
+                        # Check if there's anything in the queue that might be the meta chunk.
                         try:
                             item = lines_queue.get_nowait()
                             if isinstance(item, str) and item.startswith('{"__type":"meta"'):
                                 meta = json.loads(item)
                             else:
-                                # Put it back and use default meta
+                                # Put it back and use default meta for live streaming mode.
                                 await lines_queue.put(item)
                                 meta = {"status": 200, "headers": {}}
                         except asyncio.QueueEmpty:
-                            # No items in queue, use default successful response
+                            # No items in queue; keep a successful default for streaming mode.
                             meta = {"status": 200, "headers": {}}
-                        
+
                         if meta:
                             result = meta
                         else:
-                            res = fetch_task.result()
-                            if isinstance(res, dict) and not res.get("__streaming"):
-                                result = res
-                            else:
-                                result = {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
-                    except Exception as e:
-                        result = {"status": 502, "text": f"FETCH_EXCEPTION: {e}"}
-                elif meta:
-                    result = meta
-                
-                status_code = int(result.get("status") or 0)
+                            result = {"status": 502, "text": "FETCH_DONE_WITHOUT_META"}
+                except Exception as e:
+                    result = {"status": 502, "text": f"FETCH_EXCEPTION: {e}"}
+            elif meta:
+                result = meta
+            
+            status_code = int(result.get("status") or 0)
 
-                # If upstream rate limits us, wait and retry inside the same browser session to avoid hammering.
-                if status_code == HTTPStatus.TOO_MANY_REQUESTS and attempt < max_recaptcha_attempts - 1:
-                    retry_after = None
-                    if isinstance(result, dict) and isinstance(result.get("headers"), dict):
-                        headers_map = result.get("headers") or {}
-                        retry_after = headers_map.get("retry-after") or headers_map.get("Retry-After")
-                    sleep_seconds = _m().get_rate_limit_sleep_seconds(
-                        str(retry_after) if retry_after is not None else None,
-                        attempt,
-                    )
-                    await _m()._cancel_background_task(fetch_task)
-                    await asyncio.sleep(sleep_seconds)
-                    continue
+            # If upstream rate limits us, wait and retry inside the same browser session to avoid hammering.
+            if status_code == HTTPStatus.TOO_MANY_REQUESTS and attempt < max_recaptcha_attempts - 1:
+                retry_after = None
+                if isinstance(result, dict) and isinstance(result.get("headers"), dict):
+                    headers_map = result.get("headers") or {}
+                    retry_after = headers_map.get("retry-after") or headers_map.get("Retry-After")
+                sleep_seconds = _m().get_rate_limit_sleep_seconds(
+                    str(retry_after) if retry_after is not None else None,
+                    attempt,
+                )
+                await _m()._cancel_background_task(fetch_task)
+                await asyncio.sleep(sleep_seconds)
+                continue
 
-                if not _is_recaptcha_validation_failed(status_code, result.get("text")):
-                    # Success or non-recaptcha error. 
-                    # If success, start a task to wait for fetch_task to finish and set done_event.
-                    if status_code < 400:
-                        # If the in-page script returned a buffered body (e.g. in unit tests/mocks where
-                        # `reportChunk` isn't exercised), fall back to a plain buffered response.
-                        body_text = ""
-                        try:
-                            candidate_body = result.get("text") if isinstance(result, dict) else None
-                        except Exception:
-                            candidate_body = None
-                        if isinstance(candidate_body, str) and candidate_body:
-                            return BrowserFetchStreamResponse(
-                                status_code=status_code,
-                                headers=result.get("headers", {}) if isinstance(result, dict) else {},
-                                text=candidate_body,
-                                method=http_method,
-                                url=url,
-                            )
-
-                        def _on_fetch_task_done(task: "asyncio.Task") -> None:
-                            _m()._consume_background_task_exception(task)
-                            try:
-                                done_event.set()
-                            except Exception:
-                                pass
-
-                        try:
-                            fetch_task.add_done_callback(_on_fetch_task_done)
-                        except Exception:
-                            pass
-                        
+            if not _is_recaptcha_validation_failed(status_code, result.get("text")):
+                # Success or non-recaptcha error. 
+                # If success, start a task to wait for fetch_task to finish and set done_event.
+                if status_code < 400:
+                    # If the in-page script returned a buffered body (e.g. in unit tests/mocks where
+                    # `reportChunk` isn't exercised), fall back to a plain buffered response.
+                    body_text = ""
+                    try:
+                        candidate_body = result.get("text") if isinstance(result, dict) else None
+                    except Exception:
+                        candidate_body = None
+                    if isinstance(candidate_body, str) and candidate_body:
                         return BrowserFetchStreamResponse(
                             status_code=status_code,
-                            headers=result.get("headers", {}),
+                            headers=result.get("headers", {}) if isinstance(result, dict) else {},
+                            text=candidate_body,
                             method=http_method,
                             url=url,
-                            lines_queue=lines_queue,
-                            done_event=done_event
                         )
-                    await _m()._cancel_background_task(fetch_task)
-                    break
 
-                await _m()._cancel_background_task(fetch_task)
-                if attempt < max_recaptcha_attempts - 1:
-                    # ... retry logic ...
-                    if isinstance(payload, dict) and not bool(payload.get("recaptchaV2Token")):
+                    def _on_fetch_task_done(task: "asyncio.Task") -> None:
+                        _m()._consume_background_task_exception(task)
                         try:
-                            v2_token = await _mint_recaptcha_v2_token()
+                            done_event.set()
                         except Exception:
-                            v2_token = None
-                        if v2_token:
-                            payload["recaptchaV2Token"] = v2_token
-                            payload.pop("recaptchaV3Token", None)
-                            await asyncio.sleep(0.5)
-                            continue
+                            pass
 
                     try:
-                        await _m().click_turnstile(page)
+                        fetch_task.add_done_callback(_on_fetch_task_done)
                     except Exception:
                         pass
+                    
+                    return BrowserFetchStreamResponse(
+                        status_code=status_code,
+                        headers=result.get("headers", {}),
+                        method=http_method,
+                        url=url,
+                        lines_queue=lines_queue,
+                        done_event=done_event
+                    )
+                await _m()._cancel_background_task(fetch_task)
+                break
 
+            await _m()._cancel_background_task(fetch_task)
+            if attempt < max_recaptcha_attempts - 1:
+                # ... retry logic ...
+                if isinstance(payload, dict) and not bool(payload.get("recaptchaV2Token")):
                     try:
-                        await page.mouse.move(120 + (attempt * 10), 120 + (attempt * 10))
-                        await page.mouse.wheel(0, 250)
+                        v2_token = await _mint_recaptcha_v2_token()
                     except Exception:
-                        pass
-                    await asyncio.sleep(min(2.0 * (2**attempt), 15.0))
+                        v2_token = None
+                    if v2_token:
+                        payload["recaptchaV2Token"] = v2_token
+                        payload.pop("recaptchaV3Token", None)
+                        await asyncio.sleep(0.5)
+                        continue
 
-            response = BrowserFetchStreamResponse(
-                int(result.get("status") or 0),
-                result.get("headers") if isinstance(result, dict) else {},
-                result.get("text") if isinstance(result, dict) else "",
-                method=http_method,
-                url=url,
-            )
-            return response
-        except Exception as e:
-            _m().debug_print(f"??? Chrome fetch transport failed: {e}")
-            return None
-        finally:
-            await context.close()
+                try:
+                    await _m().click_turnstile(page)
+                except Exception:
+                    pass
+
+                try:
+                    await page.mouse.move(120 + (attempt * 10), 120 + (attempt * 10))
+                    await page.mouse.wheel(0, 250)
+                except Exception:
+                    pass
+                await asyncio.sleep(min(2.0 * (2**attempt), 15.0))
+
+        response = BrowserFetchStreamResponse(
+            int(result.get("status") or 0),
+            result.get("headers") if isinstance(result, dict) else {},
+            result.get("text") if isinstance(result, dict) else "",
+            method=http_method,
+            url=url,
+        )
+        return response
+    except Exception as e:
+        _m().debug_print(f"??? Chrome fetch transport failed: {e}")
+        return None
+    finally:
+        await context.close()
 
 
-async def fetch_lmarena_stream_via_camoufox(
+async def fetch_lmarena_stream_via_cloakbrowser(
     http_method: str,
     url: str,
     payload: dict,
@@ -1107,10 +1088,10 @@ async def fetch_lmarena_stream_via_camoufox(
     max_recaptcha_attempts: int = 3,
 ) -> Optional[BrowserFetchStreamResponse]:
     """
-    Fallback transport: fetch via Camoufox (Firefox) in-page fetch.
+    Fallback transport: fetch via CloakBrowser in-page fetch.
     Uses 'window.wrappedJSObject' for reCAPTCHA access when Chrome is blocked.
     """
-    _m().debug_print("🦊 Attempting Camoufox fetch transport...")
+    _m().debug_print("🔒 Attempting CloakBrowser fetch transport...")
     
     config = _m().get_config()
     recaptcha_sitekey, recaptcha_action = _m().get_recaptcha_settings(config)
@@ -1164,20 +1145,14 @@ async def fetch_lmarena_stream_via_camoufox(
     try:
         # Default to headful for better Turnstile/reCAPTCHA reliability; allow override via config.
         try:
-            headless_value = config.get("camoufox_fetch_headless", None)
+            headless_value = config.get("cloakbrowser_fetch_headless", None)
             headless = bool(headless_value) if headless_value is not None else True
         except Exception:
             headless = True
 
-        async with _m().AsyncCamoufox(headless=headless, main_world_eval=True) as browser:
+        browser = await _m().cloakbrowser_launch_async(headless=headless)
+        try:
             context = await browser.new_context(user_agent=user_agent or None)
-            # Small stealth tweak: reduces bot-detection surface for reCAPTCHA v3 scoring.
-            try:
-                await context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                )
-            except Exception:
-                pass
             if desired_cookies:
                 try:
                     await context.add_cookies(desired_cookies)
@@ -1185,15 +1160,15 @@ async def fetch_lmarena_stream_via_camoufox(
                     pass
 
             page = await context.new_page()
-            await _m()._maybe_apply_camoufox_window_mode(
+            await _m()._maybe_apply_cloakbrowser_window_mode(
                 page,
                 config,
-                mode_key="camoufox_fetch_window_mode",
-                marker="LMArenaBridge Camoufox Fetch",
+                mode_key="cloakbrowser_fetch_window_mode",
+                marker="LMArenaBridge CloakBrowser Fetch",
                 headless=headless,
             )
               
-            _m().debug_print(f" 🦊 Navigating to arena.ai...")
+            _m().debug_print(f"  🔒 Navigating to lmarena.ai...")
             try:
                 await asyncio.wait_for(
                     page.goto("https://arena.ai/?mode=direct", wait_until="domcontentloaded", timeout=60000),
@@ -1282,12 +1257,12 @@ async def fetch_lmarena_stream_via_camoufox(
                     val = await _m().safe_page_evaluate(page, "() => (window.wrappedJSObject || window).__token_result")
                     if val != 'PENDING':
                         if isinstance(val, str) and (val.startswith('ERROR') or val.startswith('SYNC_ERROR')):
-                            _m().debug_print(f"  ⚠️ Camoufox token mint error: {val}")
+                            _m().debug_print(f"  ⚠️ CloakBrowser token mint error: {val}")
                             return None
                         return val
                     await asyncio.sleep(0.5)
                 
-                _m().debug_print("  ⚠️ Camoufox token mint timed out.")
+                _m().debug_print("  ⚠️ CloakBrowser token mint timed out.")
                 return None
 
             async def _mint_recaptcha_v2_token() -> Optional[str]:
@@ -1417,7 +1392,7 @@ async def fetch_lmarena_stream_via_camoufox(
                         if current_recaptcha_token:
                             payload["recaptchaV3Token"] = current_recaptcha_token
                     except Exception as e:
-                        _m().debug_print(f"  ⚠️ Error minting token in Camoufox: {e}")
+                        _m().debug_print(f"  ⚠️ Error minting token in CloakBrowser: {e}")
 
                 extra_headers = {}
                 token_for_headers = current_recaptcha_token
@@ -1539,10 +1514,15 @@ async def fetch_lmarena_stream_via_camoufox(
                 method=http_method,
                 url=url,
             )
+        finally:
+            await browser.close()
 
     except Exception as e:
-        _m().debug_print(f"❌ Camoufox fetch transport failed: {e}")
+        _m().debug_print(f"❌ CloakBrowser fetch transport failed: {e}")
         return None
+
+
+fetch_lmarena_stream_via_camoufox = fetch_lmarena_stream_via_cloakbrowser  # backward compat
 
 
 async def fetch_via_proxy_queue(
@@ -1749,25 +1729,40 @@ async def push_proxy_chunk(jid, d) -> None:
             _m().debug_print(f"🦊 Camoufox proxy job {job_id[:8]} done")
 
 
-async def camoufox_proxy_worker():
+async def cloakbrowser_proxy_worker():
     """
-    Internal Userscript-Proxy client backed by Camoufox.
+    Internal Userscript-Proxy client backed by CloakBrowser.
     Maintains a SINGLE persistent browser instance to avoid crash loops and resource exhaustion.
     """
     # Mark the proxy as alive immediately
     _touch_userscript_poll()
-    _m().debug_print("🦊 Camoufox proxy worker started (Singleton Mode).")
+    _m().debug_print("🔒 CloakBrowser proxy worker started (Singleton Mode).")
 
-    browser_cm = None
+    launch_resource = None
     browser = None
     context = None
     page = None
+    persistent_context_enabled = False
 
     proxy_recaptcha_sitekey = _m().RECAPTCHA_SITEKEY
     proxy_recaptcha_action = _m().RECAPTCHA_ACTION
     last_signup_attempt_at: float = 0.0
     
     queue = _get_userscript_proxy_queue()
+
+    async def _close_launch_resource() -> None:
+        nonlocal launch_resource, browser, context, page, persistent_context_enabled
+        target = launch_resource
+        launch_resource = None
+        browser = None
+        context = None
+        page = None
+        persistent_context_enabled = False
+        if target is not None:
+            try:
+                await target.close()
+            except Exception:
+                pass
 
     while True:
         try:
@@ -1780,25 +1775,17 @@ async def camoufox_proxy_worker():
             else:
                 try:
                     if page.is_closed():
-                        _m().debug_print("⚠️ Camoufox proxy page closed. Relaunching...")
+                        _m().debug_print("⚠️ CloakBrowser proxy page closed. Relaunching...")
                         needs_launch = True
                     elif not context.pages:
-                        _m().debug_print("⚠️ Camoufox proxy context has no pages. Relaunching...")
+                        _m().debug_print("⚠️ CloakBrowser proxy context has no pages. Relaunching...")
                         needs_launch = True
                 except Exception:
                     needs_launch = True
 
             if needs_launch:
                 # Cleanup existing if any
-                if browser_cm:
-                    try:
-                        await browser_cm.__aexit__(None, None, None)
-                    except Exception:
-                        pass
-                browser_cm = None
-                browser = None
-                context = None
-                page = None
+                await _close_launch_resource()
 
                 cfg = _m().get_config()
                 recaptcha_sitekey, recaptcha_action = _m().get_recaptcha_settings(cfg)
@@ -1806,16 +1793,16 @@ async def camoufox_proxy_worker():
                 proxy_recaptcha_action = recaptcha_action
                 user_agent = _m().normalize_user_agent_value(cfg.get("user_agent"))
                 
-                headless_value = cfg.get("camoufox_proxy_headless", None)
+                headless_value = cfg.get("cloakbrowser_proxy_headless", None)
                 headless = bool(headless_value) if headless_value is not None else True
-                launch_timeout = float(cfg.get("camoufox_proxy_launch_timeout_seconds", 90))
+                launch_timeout = float(cfg.get("cloakbrowser_proxy_launch_timeout_seconds", 90))
                 launch_timeout = max(20.0, min(launch_timeout, 300.0))
 
-                _m().debug_print(f"🦊 Camoufox proxy: launching browser (headless={headless})...")
+                _m().debug_print(f"🔒 CloakBrowser proxy: launching browser (headless={headless})...")
 
                 profile_dir = None
                 try:
-                    profile_dir_value = cfg.get("camoufox_proxy_user_data_dir")
+                    profile_dir_value = cfg.get("cloakbrowser_proxy_user_data_dir")
                     if profile_dir_value:
                         profile_dir = Path(str(profile_dir_value)).expanduser()
                 except Exception:
@@ -1826,46 +1813,47 @@ async def camoufox_proxy_worker():
                     except Exception:
                         pass
 
-                persistent_pref = cfg.get("camoufox_proxy_persistent_context", None)
+                persistent_pref = cfg.get("cloakbrowser_proxy_persistent_context", None)
                 want_persistent = bool(persistent_pref) if persistent_pref is not None else False
                 
-                persistent_context_enabled = False
                 if want_persistent and isinstance(profile_dir, Path) and profile_dir.exists():
                     persistent_context_enabled = True
-                    browser_cm = _m().AsyncCamoufox(
-                        headless=headless,
-                        main_world_eval=True,
-                        persistent_context=True,
-                        user_data_dir=str(profile_dir),
-                    )
-                else:
-                    browser_cm = _m().AsyncCamoufox(headless=headless, main_world_eval=True)
 
                 try:
-                    browser = await asyncio.wait_for(browser_cm.__aenter__(), timeout=launch_timeout)
+                    if persistent_context_enabled:
+                        context = await asyncio.wait_for(
+                            _m().cloakbrowser_launch_persistent_context_async(
+                                str(profile_dir),
+                                headless=headless,
+                            ),
+                            timeout=launch_timeout,
+                        )
+                        browser = context
+                        launch_resource = context
+                    else:
+                        browser = await asyncio.wait_for(
+                            _m().cloakbrowser_launch_async(headless=headless),
+                            timeout=launch_timeout,
+                        )
+                        launch_resource = browser
+                        context = await browser.new_context(user_agent=user_agent or None)
                 except Exception as e:
-                    _m().debug_print(f"⚠️ Camoufox launch failed ({type(e).__name__}): {e}")
+                    _m().debug_print(f"⚠️ CloakBrowser launch failed ({type(e).__name__}): {e}")
                     if persistent_context_enabled:
                         _m().debug_print("⚠️ Retrying without persistence...")
-                        try:
-                            await browser_cm.__aexit__(None, None, None)
-                        except Exception:
-                            pass
+                        await _close_launch_resource()
                         persistent_context_enabled = False
-                        browser_cm = _m().AsyncCamoufox(headless=headless, main_world_eval=True)
-                        browser = await asyncio.wait_for(browser_cm.__aenter__(), timeout=launch_timeout)
+                        browser = await asyncio.wait_for(
+                            _m().cloakbrowser_launch_async(headless=headless),
+                            timeout=launch_timeout,
+                        )
+                        launch_resource = browser
+                        context = await browser.new_context(user_agent=user_agent or None)
                     else:
                         raise
 
                 if persistent_context_enabled:
                     context = browser
-                else:
-                    context = await browser.new_context(user_agent=user_agent or None)
-                
-                try:
-                    await context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
-                except Exception:
-                    pass
 
                 # Inject only a minimal set of cookies (do not overwrite browser-managed state).
                 cookie_store = cfg.get("browser_cookies")
@@ -1982,18 +1970,18 @@ async def camoufox_proxy_worker():
                     pass
 
                 page = await context.new_page()
-                await _m()._maybe_apply_camoufox_window_mode(
+                await _m()._maybe_apply_cloakbrowser_window_mode(
                     page,
                     cfg,
-                    mode_key="camoufox_proxy_window_mode",
-                    marker="LMArenaBridge Camoufox Proxy",
+                    mode_key="cloakbrowser_proxy_window_mode",
+                    marker="LMArenaBridge CloakBrowser Proxy",
                     headless=headless,
                 )
 
                 try:
-                    _m().debug_print("🦊 Camoufox proxy: navigating to https://arena.ai/?mode=direct ...")
-                    await page.goto("https://arena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
-                    _m().debug_print("🦊 Camoufox proxy: navigation complete.")
+                    _m().debug_print("🔒 CloakBrowser proxy: navigating to https://lmarena.ai/?mode=direct ...")
+                    await page.goto("https://lmarena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+                    _m().debug_print("🔒 CloakBrowser proxy: navigation complete.")
                 except Exception as e:
                     _m().debug_print(f"⚠️ Navigation warning: {e}")
 
@@ -2030,7 +2018,7 @@ async def camoufox_proxy_worker():
                 try:
                     title = await page.title()
                     if "Just a moment" in title:
-                        _m().debug_print("🦊 Cloudflare challenge detected.")
+                        _m().debug_print("🔒 Cloudflare challenge detected.")
                         await _m().click_turnstile(page)
                         await asyncio.sleep(2)
                 except Exception:
@@ -2049,7 +2037,7 @@ async def camoufox_proxy_worker():
                     _cfg = _m().get_config()
                     if _m()._upsert_browser_session_into_config(_cfg, fresh_cookies):
                         _m().save_config(_cfg)
-                        _m().debug_print("🦊 Camoufox proxy: initial cookies saved to config.")
+                        _m().debug_print("🔒 CloakBrowser proxy: initial cookies saved to config.")
                 except Exception:
                     pass
 
@@ -2319,7 +2307,7 @@ async def camoufox_proxy_worker():
                     except Exception:
                         err = ""
                 if widget_id is None:
-                    _m().debug_print(f"⚠️ Camoufox proxy: Turnstile render failed (stage={stage} err={err[:120]})")
+                    _m().debug_print(f"⚠️ CloakBrowser proxy: Turnstile render failed (stage={stage} err={err[:120]})")
                     return
 
                 started = _m().time.monotonic()
@@ -2347,13 +2335,13 @@ async def camoufox_proxy_worker():
                         pass
 
                 if not token_value:
-                    _m().debug_print("⚠️ Camoufox proxy: Turnstile mint failed (timeout).")
+                    _m().debug_print("⚠️ CloakBrowser proxy: Turnstile mint failed (timeout).")
                     return
 
                 try:
                     if provisional_user_id:
                         _m().debug_print(
-                            f"🦊 Camoufox proxy: provisional_user_id (trunc): {provisional_user_id[:8]}...{provisional_user_id[-4:]}"
+                            f"🔒 CloakBrowser proxy: provisional_user_id (trunc): {provisional_user_id[:8]}...{provisional_user_id[-4:]}"
                         )
                     resp = await _m()._camoufox_proxy_signup_anonymous_user(
                         page,
@@ -2370,7 +2358,7 @@ async def camoufox_proxy_worker():
                     status = int((resp or {}).get("status") or 0) if isinstance(resp, dict) else 0
                 except Exception:
                     status = 0
-                _m().debug_print(f"🦊 Camoufox proxy: /nextjs-api/sign-up status {status}")
+                _m().debug_print(f"🔒 CloakBrowser proxy: /nextjs-api/sign-up status {status}")
 
                 # Some sign-up responses return the Supabase session JSON in the body instead of setting a cookie.
                 # When that happens, encode it into the `arena-auth-prod-v1` cookie format and inject it.
@@ -2379,7 +2367,7 @@ async def camoufox_proxy_worker():
                 except Exception:
                     body_text = ""
                 if status >= 400 and body_text:
-                    _m().debug_print(f"🦊 Camoufox proxy: /nextjs-api/sign-up body (trunc): {body_text[:200]}")
+                    _m().debug_print(f"🔒 CloakBrowser proxy: /nextjs-api/sign-up body (trunc): {body_text[:200]}")
                 if status == 400 and "User already exists" in body_text:
                     try:
                         await _m()._maybe_inject_arena_auth_cookie_from_localstorage(page, context)
@@ -2401,7 +2389,7 @@ async def camoufox_proxy_worker():
                             _m()._capture_ephemeral_arena_auth_token_from_cookies(
                                 [{"name": "arena-auth-prod-v1", "value": derived_cookie}]
                             )
-                            _m().debug_print("🦊 Camoufox proxy: injected arena-auth cookie from sign-up response body.")
+                            _m().debug_print("🔒 CloakBrowser proxy: injected arena-auth cookie from sign-up response body.")
                     except Exception:
                         pass
 
@@ -2429,15 +2417,15 @@ async def camoufox_proxy_worker():
                         if not cur or _m().is_arena_auth_token_expired(cur, skew_seconds=0):
                             await asyncio.sleep(1.0)
                             continue
-                        _m().debug_print("🦊 Camoufox proxy: acquired arena-auth-prod-v1 cookie (anonymous user).")
+                        _m().debug_print("🔒 CloakBrowser proxy: acquired arena-auth-prod-v1 cookie (anonymous user).")
                         # Save to browser_cookies so plain HTTP requests can use it without browser transport
                         try:
                             cfg = _m().get_config()
                             if _m()._upsert_browser_session_into_config(cfg, [{"name": "arena-auth-prod-v1", "value": cur}]):
                                 _m().save_config(cfg)
-                                _m().debug_print("🦊 Camoufox proxy: saved arena-auth to browser_cookies for HTTP fallback.")
+                                _m().debug_print("🔒 CloakBrowser proxy: saved arena-auth to browser_cookies for HTTP fallback.")
                         except (IOError, json.JSONDecodeError) as e:
-                            _m().debug_print(f"🦊 Camoufox proxy: failed to save arena-auth to config: {e}")
+                            _m().debug_print(f"🔒 CloakBrowser proxy: failed to save arena-auth to config: {e}")
                         except Exception:
                             pass
                         break
@@ -2706,7 +2694,7 @@ async def camoufox_proxy_worker():
               }
             }"""
 
-            _m().debug_print(f"🦊 Camoufox proxy: running job {job_id[:8]}...")
+            _m().debug_print(f"🔒 CloakBrowser proxy: running job {job_id[:8]}...")
             
             try:
                 # Use existing browser cookie if valid, to avoid clobbering fresh anonymous sessions
@@ -2738,7 +2726,7 @@ async def camoufox_proxy_worker():
                         )
                     )
                 elif browser_auth_cookie and not use_job_token:
-                    _m().debug_print("🦊 Camoufox proxy: using valid browser auth cookie (job token is empty or invalid).")
+                    _m().debug_print("🔒 CloakBrowser proxy: using valid browser auth cookie (job token is empty or invalid).")
             except Exception:
                 pass
 
@@ -2752,9 +2740,9 @@ async def camoufox_proxy_worker():
                     expired = _m().is_arena_auth_token_expired(current_cookie, skew_seconds=0)
                 except Exception:
                     expired = False
-                _m().debug_print(f"🦊 Camoufox proxy: arena-auth cookie present (len={len(current_cookie)} expired={expired})")
+                _m().debug_print(f"🔒 CloakBrowser proxy: arena-auth cookie present (len={len(current_cookie)} expired={expired})")
             else:
-                _m().debug_print("🦊 Camoufox proxy: arena-auth cookie missing")
+                _m().debug_print("🔒 CloakBrowser proxy: arena-auth cookie missing")
             try:
                 needs_signup = (not current_cookie) or _m().is_arena_auth_token_expired(current_cookie, skew_seconds=0)
             except Exception:
@@ -2797,16 +2785,16 @@ async def camoufox_proxy_worker():
                 await push_proxy_chunk(job_id, {"error": str(e), "done": True})
 
         except asyncio.CancelledError:
-            _m().debug_print("🦊 Camoufox proxy worker cancelled.")
-            if browser_cm:
-                try:
-                    await browser_cm.__aexit__(None, None, None)
-                except Exception:
-                    pass
+            _m().debug_print("🔒 CloakBrowser proxy worker cancelled.")
+            await _close_launch_resource()
             return
         except Exception as e:
-            _m().debug_print(f"⚠️ Camoufox proxy worker exception: {e}")
+            _m().debug_print(f"⚠️ CloakBrowser proxy worker exception: {e}")
             await asyncio.sleep(5.0)
             # Mark for relaunch
             browser = None
+            context = None
             page = None
+
+
+camoufox_proxy_worker = cloakbrowser_proxy_worker

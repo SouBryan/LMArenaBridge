@@ -48,14 +48,10 @@ class TestStreamTaskExceptionSilenced(unittest.IsolatedAsyncioTestCase):
             mock_context = AsyncMock()
             mock_context.new_page.return_value = mock_page
             mock_context.cookies.return_value = []
-
-            mock_playwright = AsyncMock()
-            mock_playwright.chromium.launch_persistent_context.return_value = mock_context
-            mock_playwright.__aenter__.return_value = mock_playwright
+            mock_context.close = AsyncMock()
 
             with (
-                patch("playwright.async_api.async_playwright", return_value=mock_playwright),
-                patch("src.main.find_chrome_executable", return_value="C:\\fake\\chrome.exe"),
+                patch("src.main.cloakbrowser_launch_persistent_context_async", return_value=mock_context),
                 patch("src.main.get_config", return_value={}),
                 patch("src.main.get_recaptcha_settings", return_value=("key", "action")),
                 patch("src.main.click_turnstile", AsyncMock(return_value=False)),

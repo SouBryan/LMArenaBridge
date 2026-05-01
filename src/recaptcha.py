@@ -2,9 +2,9 @@
 reCAPTCHA and browser challenge handling for LMArenaBridge.
 
 Handles:
-- reCAPTCHA v3 token minting via Chrome (Playwright) and Camoufox
+- reCAPTCHA v3 token minting via Chrome-style persistent context and CloakBrowser
 - reCAPTCHA v3 token caching and refresh
-- Camoufox anonymous user signup (Turnstile)
+- CloakBrowser anonymous user signup (Turnstile)
 - Finding Chrome/Edge executable
 - Provisional user ID injection into browser context
 - LMArena auth cookie recovery from localStorage
@@ -236,7 +236,7 @@ async def _mint_recaptcha_v3_token_in_page(
     return str(tok or "").strip()
 
 
-async def _camoufox_proxy_signup_anonymous_user(
+async def _cloakbrowser_proxy_signup_anonymous_user(
     page,
     *,
     turnstile_token: str,
@@ -262,7 +262,7 @@ async def _camoufox_proxy_signup_anonymous_user(
         action=recaptcha_action,
     )
     if not recaptcha_token:
-        _m().debug_print("⚠️ Camoufox proxy: reCAPTCHA mint failed for anonymous signup.")
+        _m().debug_print("⚠️ CloakBrowser proxy: reCAPTCHA mint failed for anonymous signup.")
         return None
 
     sign_up_js = """async ({ turnstileToken, recaptchaToken, provisionalUserId }) => {
@@ -299,6 +299,9 @@ async def _camoufox_proxy_signup_anonymous_user(
         _m().debug_print(f"Unexpected error during anonymous signup evaluate: {type(e).__name__}: {e}")
         resp = None
     return resp if isinstance(resp, dict) else None
+
+
+_camoufox_proxy_signup_anonymous_user = _cloakbrowser_proxy_signup_anonymous_user
 
 
 async def _set_provisional_user_id_in_browser(page, context, *, provisional_user_id: str) -> None:
@@ -395,7 +398,7 @@ async def _maybe_inject_arena_auth_cookie_from_localstorage(page, context) -> Op
                 page_url = ""
             await context.add_cookies(_m()._arena_auth_cookie_specs(cookie, page_url=page_url))
             _m()._capture_ephemeral_arena_auth_token_from_cookies([{"name": "arena-auth-prod-v1", "value": cookie}])
-            _m().debug_print("🦊 Camoufox proxy: injected arena-auth cookie from localStorage session.")
+            _m().debug_print("🔒 CloakBrowser proxy: injected arena-auth cookie from localStorage session.")
             return cookie
         except Exception:
             continue
@@ -448,15 +451,6 @@ def find_chrome_executable() -> Optional[str]:
 
 
 async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
-    try:
-        from playwright.async_api import async_playwright  # type: ignore
-    except Exception:
-        return None
-
-    chrome_path = find_chrome_executable()
-    if not chrome_path:
-        return None
-
     profile_dir = Path(_m().CONFIG_FILE).with_name("chrome_grecaptcha")
 
     cf_clearance = str(config.get("cf_clearance") or "").strip()
@@ -478,136 +472,120 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
         cookies.append(
             {"name": "provisional_user_id", "value": provisional_user_id, "domain": ".arena.ai"}
         )
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            executable_path=chrome_path,
-            headless=False,  # Headful for better reCAPTCHA score/warmup
-            user_agent=user_agent or None,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--no-first-run",
-                "--no-default-browser-check",
-            ],
-        )
-        try:
-            # Small stealth tweak: reduces bot-detection surface for reCAPTCHA v3 scoring.
+    context = await _m().cloakbrowser_launch_persistent_context_async(
+        str(profile_dir),
+        headless=False,
+    )
+    try:
+        if cookies:
             try:
-                await context.add_init_script(
-                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-                )
-            except Exception:
-                pass
-
-            if cookies:
+                existing_names: set[str] = set()
                 try:
-                    existing_names: set[str] = set()
-                    try:
-                        existing = await _m()._get_arena_context_cookies(context)
-                        for c in existing or []:
-                            name = c.get("name")
-                            if name:
-                                existing_names.add(str(name))
-                    except Exception:
-                        existing_names = set()
+                    existing = await _m()._get_arena_context_cookies(context)
+                    for c in existing or []:
+                        name = c.get("name")
+                        if name:
+                            existing_names.add(str(name))
+                except Exception:
+                    existing_names = set()
 
-                    cookies_to_add: list[dict] = []
-                    for c in cookies:
-                        name = str(c.get("name") or "")
-                        if not name:
-                            continue
-                        # Always ensure the auth cookie matches the selected upstream token.
-                        if name == "arena-auth-prod-v1":
-                            cookies_to_add.append(c)
-                            continue
-
-                        # Do NOT overwrite/inject Cloudflare or reCAPTCHA cookies in the persistent profile.
-                        # The profile manages these itself; injecting stale ones from config causes 403s.
-                        if name in ("cf_clearance", "__cf_bm", "_GRECAPTCHA"):
-                            continue
-
-                        # Avoid overwriting existing Cloudflare/session cookies in the persistent profile.
-                        if name in existing_names:
-                            continue
+                cookies_to_add: list[dict] = []
+                for c in cookies:
+                    name = str(c.get("name") or "")
+                    if not name:
+                        continue
+                    # Always ensure the auth cookie matches the selected upstream token.
+                    if name == "arena-auth-prod-v1":
                         cookies_to_add.append(c)
+                        continue
 
-                    if cookies_to_add:
-                        await context.add_cookies(cookies_to_add)
-                except Exception:
-                    pass
+                    # Do NOT overwrite/inject Cloudflare or reCAPTCHA cookies in the persistent profile.
+                    # The profile manages these itself; injecting stale ones from config causes 403s.
+                    if name in ("cf_clearance", "__cf_bm", "_GRECAPTCHA"):
+                        continue
 
-            page = await context.new_page()
-            await _m()._maybe_apply_camoufox_window_mode(
-                page,
-                config,
-                mode_key="chrome_fetch_window_mode",
-                marker="LMArenaBridge Chrome Fetch",
-                headless=False,
-            )
-            await page.goto("https://arena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+                    # Avoid overwriting existing Cloudflare/session cookies in the persistent profile.
+                    if name in existing_names:
+                        continue
+                    cookies_to_add.append(c)
 
-            # Best-effort: if we land on a Cloudflare challenge page, try clicking Turnstile.
-            try:
-                for _ in range(5):
-                    title = await page.title()
-                    if "Just a moment" not in title:
-                        break
-                    await _m().click_turnstile(page)
-                    await asyncio.sleep(2)
+                if cookies_to_add:
+                    await context.add_cookies(cookies_to_add)
             except Exception:
                 pass
 
-            # Light warm-up (often improves reCAPTCHA v3 score vs firing immediately).
+        page = await context.new_page()
+        await _m()._maybe_apply_cloakbrowser_window_mode(
+            page,
+            config,
+            mode_key="chrome_fetch_window_mode",
+            marker="LMArenaBridge Chrome Fetch",
+            headless=False,
+        )
+        await page.goto("https://arena.ai/?mode=direct", wait_until="domcontentloaded", timeout=120000)
+
+        # Best-effort: if we land on a Cloudflare challenge page, try clicking Turnstile.
+        try:
+            for _ in range(5):
+                title = await page.title()
+                if "Just a moment" not in title:
+                    break
+                await _m().click_turnstile(page)
+                await asyncio.sleep(2)
+        except Exception:
+            pass
+
+        # Light warm-up (often improves reCAPTCHA v3 score vs firing immediately).
+        try:
+            await page.mouse.move(100, 100)
+            await page.mouse.wheel(0, 200)
+            await asyncio.sleep(1)
+            await page.mouse.move(200, 300)
+            await page.mouse.wheel(0, 300)
+            await asyncio.sleep(3) # Increased "Human" pause
+        except Exception:
+            pass
+
+        # Persist updated cookies/UA from this real browser context (often refreshes arena-auth-prod-v1).
+        try:
+            fresh_cookies = await _m()._get_arena_context_cookies(context, page_url=str(getattr(page, "url", "") or ""))
             try:
-                await page.mouse.move(100, 100)
-                await page.mouse.wheel(0, 200)
-                await asyncio.sleep(1)
-                await page.mouse.move(200, 300)
-                await page.mouse.wheel(0, 300)
-                await asyncio.sleep(3) # Increased "Human" pause
+                ua_now = await page.evaluate("() => navigator.userAgent")
             except Exception:
-                pass
+                ua_now = user_agent
+            if _m()._upsert_browser_session_into_config(config, fresh_cookies, user_agent=ua_now):
+                _m().save_config(config)
+        except Exception:
+            pass
 
-            # Persist updated cookies/UA from this real browser context (often refreshes arena-auth-prod-v1).
-            try:
-                fresh_cookies = await _m()._get_arena_context_cookies(context, page_url=str(getattr(page, "url", "") or ""))
-                try:
-                    ua_now = await page.evaluate("() => navigator.userAgent")
-                except Exception:
-                    ua_now = user_agent
-                if _m()._upsert_browser_session_into_config(config, fresh_cookies, user_agent=ua_now):
-                    _m().save_config(config)
-            except Exception:
-                pass
+        await page.wait_for_function(
+            "window.grecaptcha && ("
+            "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
+            "typeof window.grecaptcha.execute === 'function'"
+            ")",
+            timeout=60000,
+        )
 
-            await page.wait_for_function(
-                "window.grecaptcha && ("
-                "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
-                "typeof window.grecaptcha.execute === 'function'"
-                ")",
-                timeout=60000,
-            )
-
-            token = await page.evaluate(
-                """({sitekey, action}) => new Promise((resolve, reject) => {
-                  const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
-                    ? window.grecaptcha.enterprise
-                    : window.grecaptcha;
-                  if (!g || typeof g.execute !== 'function') return reject('NO_GRECAPTCHA');
-                  try {
-                    g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
-                  } catch (e) { reject(String(e)); }
-                })""",
-                {"sitekey": recaptcha_sitekey, "action": recaptcha_action},
-            )
-            if isinstance(token, str) and token:
-                return token
-            return None
-        except Exception as e:
-            _m().debug_print(f"⚠️ Chrome reCAPTCHA retrieval failed: {e}")
-            return None
-        finally:
-            await context.close()
+        token = await page.evaluate(
+            """({sitekey, action}) => new Promise((resolve, reject) => {
+              const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
+                ? window.grecaptcha.enterprise
+                : window.grecaptcha;
+              if (!g || typeof g.execute !== 'function') return reject('NO_GRECAPTCHA');
+              try {
+                g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
+              } catch (e) { reject(String(e)); }
+            })""",
+            {"sitekey": recaptcha_sitekey, "action": recaptcha_action},
+        )
+        if isinstance(token, str) and token:
+            return token
+        return None
+    except Exception as e:
+        _m().debug_print(f"⚠️ Chrome reCAPTCHA retrieval failed: {e}")
+        return None
+    finally:
+        await context.close()
 
 
 async def get_recaptcha_v3_token() -> Optional[str]:
@@ -630,9 +608,9 @@ async def get_recaptcha_v3_token() -> Optional[str]:
             _m().RECAPTCHA_EXPIRY = datetime.now(timezone.utc) + timedelta(seconds=110)
             return chrome_token
 
-        # Use main world (main_world_eval=True) to access wrappedJSObject properly.
-        # This bypasses Firefox's Xray wrapper for cross-origin reCAPTCHA objects.
-        async with _m().AsyncCamoufox(headless=True, main_world_eval=True) as browser:
+        # Use a real browser context to access wrappedJSObject-compatible page state during minting.
+        browser = await _m().cloakbrowser_launch_async(headless=True)
+        try:
             context = await browser.new_context()
             if cf_clearance:
                 await context.add_cookies([{
@@ -798,6 +776,8 @@ async def get_recaptcha_v3_token() -> Optional[str]:
             else:
                 _m().debug_print("❌ No token returned from reCAPTCHA.")
                 return None
+        finally:
+            await browser.close()
 
     except Exception as e:
         _m().debug_print(f"❌ Unexpected error: {e}")

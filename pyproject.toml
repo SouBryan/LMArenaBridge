@@ -24,8 +24,7 @@ classifiers = [
 dependencies = [
     "fastapi>=0.100.0",
     "uvicorn[standard]>=0.23.0",
-    "camoufox",
-    "playwright",
+    "cloakbrowser",
     "httpx",
     "cloudscraper",
     "python-multipart",
@@ -155,7 +154,7 @@ python_functions = ["test_*"]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "chrome: marks tests that require Chrome",
-    "camoufox: marks tests that require Camoufox",
+    "cloakbrowser: marks tests that require CloakBrowser",
     "browser: marks tests that require browser automation",
 ]
 asyncio_mode = "auto"

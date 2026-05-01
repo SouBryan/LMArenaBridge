@@ -16,20 +16,16 @@ class TestChromeFetchWindowMode(BaseBridgeTest):
         mock_context = AsyncMock()
         mock_context.new_page.return_value = mock_page
         mock_context.cookies.return_value = []
-
-        mock_playwright = AsyncMock()
-        mock_playwright.chromium.launch_persistent_context.return_value = mock_context
-        mock_playwright.__aenter__.return_value = mock_playwright
+        mock_context.close = AsyncMock()
 
         window_mode_mock = AsyncMock()
 
         with (
-            patch("playwright.async_api.async_playwright", return_value=mock_playwright),
-            patch.object(self.main, "find_chrome_executable", return_value="C:/chrome.exe"),
+            patch("src.main.cloakbrowser_launch_persistent_context_async", return_value=mock_context),
             patch.object(self.main, "get_recaptcha_settings", return_value=("key", "action")),
             patch.object(self.main, "click_turnstile", AsyncMock(return_value=True)),
             patch.object(self.main.asyncio, "sleep", AsyncMock()),
-            patch.object(self.main, "_maybe_apply_camoufox_window_mode", window_mode_mock),
+            patch.object(self.main, "_maybe_apply_cloakbrowser_window_mode", window_mode_mock),
         ):
             resp = await self.main.fetch_lmarena_stream_via_chrome(
                 "POST",

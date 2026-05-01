@@ -10,28 +10,28 @@ class _FakePage:
         return None
 
 
-class TestCamoufoxWindowMode(BaseBridgeTest):
-    async def test_get_config_defaults_camoufox_window_modes_hide(self) -> None:
+class TestCloakBrowserWindowMode(BaseBridgeTest):
+    async def test_get_config_defaults_cloakbrowser_window_modes_hide(self) -> None:
         config = self.main.get_config()
-        self.assertEqual("hide", config.get("camoufox_proxy_window_mode"))
-        self.assertEqual("hide", config.get("camoufox_fetch_window_mode"))
+        self.assertEqual("hide", config.get("cloakbrowser_proxy_window_mode"))
+        self.assertEqual("hide", config.get("cloakbrowser_fetch_window_mode"))
         self.assertEqual("hide", config.get("chrome_fetch_window_mode"))
 
-    async def test_camoufox_proxy_window_mode_hide_calls_win32_helper(self) -> None:
+    async def test_cloakbrowser_proxy_window_mode_hide_calls_win32_helper(self) -> None:
         from unittest.mock import patch
 
         page = _FakePage()
         config = self.main.get_config()
-        config["camoufox_proxy_window_mode"] = "hide"
+        config["cloakbrowser_proxy_window_mode"] = "hide"
 
         with (
             patch.object(self.main, "_is_windows", return_value=True),
             patch.object(self.main, "_windows_apply_window_mode_by_title_substring", return_value=True) as hide,
         ):
-            await self.main._maybe_apply_camoufox_window_mode(
+            await self.main._maybe_apply_cloakbrowser_window_mode(
                 page,
                 config,
-                mode_key="camoufox_proxy_window_mode",
+                mode_key="cloakbrowser_proxy_window_mode",
                 marker="TEST_TITLE",
                 headless=False,
             )
@@ -53,16 +53,16 @@ class TestCamoufoxWindowMode(BaseBridgeTest):
         page2.context = ctx
 
         config = self.main.get_config()
-        config["camoufox_proxy_window_mode"] = "hide"
+        config["cloakbrowser_proxy_window_mode"] = "hide"
 
         with (
             patch.object(self.main, "_is_windows", return_value=True),
             patch.object(self.main, "_windows_apply_window_mode_by_title_substring", return_value=True),
         ):
-            await self.main._maybe_apply_camoufox_window_mode(
+            await self.main._maybe_apply_cloakbrowser_window_mode(
                 page1,
                 config,
-                mode_key="camoufox_proxy_window_mode",
+                mode_key="cloakbrowser_proxy_window_mode",
                 marker="TEST_TITLE",
                 headless=False,
             )
@@ -70,21 +70,21 @@ class TestCamoufoxWindowMode(BaseBridgeTest):
         self.assertTrue(page1.evaluate_calls, "Expected page1 title to be marked")
         self.assertTrue(page2.evaluate_calls, "Expected page2 title to be marked")
 
-    async def test_camoufox_proxy_window_mode_visible_is_noop(self) -> None:
+    async def test_cloakbrowser_proxy_window_mode_visible_is_noop(self) -> None:
         from unittest.mock import patch
 
         page = _FakePage()
         config = self.main.get_config()
-        config["camoufox_proxy_window_mode"] = "visible"
+        config["cloakbrowser_proxy_window_mode"] = "visible"
 
         with (
             patch.object(self.main, "_is_windows", return_value=True),
             patch.object(self.main, "_windows_apply_window_mode_by_title_substring", return_value=True) as hide,
         ):
-            await self.main._maybe_apply_camoufox_window_mode(
+            await self.main._maybe_apply_cloakbrowser_window_mode(
                 page,
                 config,
-                mode_key="camoufox_proxy_window_mode",
+                mode_key="cloakbrowser_proxy_window_mode",
                 marker="TEST_TITLE",
                 headless=False,
             )
@@ -149,7 +149,7 @@ class TestCamoufoxWindowMode(BaseBridgeTest):
         DestroyWindow.argtypes = [wintypes.HWND]
         DestroyWindow.restype = wintypes.BOOL
 
-        marker = f"LMArenaBridge Camoufox Hide Test PID {os.getpid()}"
+        marker = f"LMArenaBridge CloakBrowser Hide Test PID {os.getpid()}"
         hwnd = CreateWindowExW(
             WS_EX_APPWINDOW,
             "STATIC",
@@ -181,21 +181,21 @@ class TestCamoufoxWindowMode(BaseBridgeTest):
         finally:
             DestroyWindow(hwnd)
 
-    async def test_camoufox_proxy_window_mode_headless_is_noop(self) -> None:
+    async def test_cloakbrowser_proxy_window_mode_headless_is_noop(self) -> None:
         from unittest.mock import patch
 
         page = _FakePage()
         config = self.main.get_config()
-        config["camoufox_proxy_window_mode"] = "hide"
+        config["cloakbrowser_proxy_window_mode"] = "hide"
 
         with (
             patch.object(self.main, "_is_windows", return_value=True),
             patch.object(self.main, "_windows_apply_window_mode_by_title_substring", return_value=True) as hide,
         ):
-            await self.main._maybe_apply_camoufox_window_mode(
+            await self.main._maybe_apply_cloakbrowser_window_mode(
                 page,
                 config,
-                mode_key="camoufox_proxy_window_mode",
+                mode_key="cloakbrowser_proxy_window_mode",
                 marker="TEST_TITLE",
                 headless=True,
             )

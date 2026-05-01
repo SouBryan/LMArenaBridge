@@ -12,12 +12,12 @@ class TestRecaptchaChromeFallback(unittest.IsolatedAsyncioTestCase):
 
         with patch.object(main, "get_config", return_value={}), patch.object(
             main, "get_recaptcha_v3_token_with_chrome", chrome_mock
-        ), patch.object(main, "AsyncCamoufox") as camoufox_mock:
+        ), patch.object(main, "cloakbrowser_launch_async") as launch_mock:
             token = await main.get_recaptcha_v3_token()
 
         self.assertEqual(token, "token-123")
         chrome_mock.assert_awaited()
-        camoufox_mock.assert_not_called()
+        launch_mock.assert_not_called()
 
 
 if __name__ == "__main__":

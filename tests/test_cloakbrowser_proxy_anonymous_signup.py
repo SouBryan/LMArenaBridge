@@ -3,8 +3,8 @@ from unittest.mock import AsyncMock
 from tests._stream_test_utils import BaseBridgeTest
 
 
-class TestCamoufoxProxyAnonymousSignup(BaseBridgeTest):
-    async def test_camoufox_proxy_signup_posts_turnstile_and_recaptcha_tokens(self) -> None:
+class TestCloakBrowserProxyAnonymousSignup(BaseBridgeTest):
+    async def test_cloakbrowser_proxy_signup_posts_turnstile_and_recaptcha_tokens(self) -> None:
         page = AsyncMock()
 
         async def eval_side_effect(script, arg=None):  # noqa: ANN001
@@ -25,7 +25,7 @@ class TestCamoufoxProxyAnonymousSignup(BaseBridgeTest):
 
         page.evaluate.side_effect = eval_side_effect
 
-        resp = await self.main._camoufox_proxy_signup_anonymous_user(
+        resp = await self.main._cloakbrowser_proxy_signup_anonymous_user(
             page,
             turnstile_token="turnstile-token-1",
             provisional_user_id="provisional-user-id-1",

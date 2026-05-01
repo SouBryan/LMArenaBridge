@@ -41,18 +41,14 @@ class TestUserscriptProxyUrlNormalization(BaseBridgeTest):
         mock_context = AsyncMock()
         mock_context.new_page.return_value = mock_page
         mock_context.cookies.return_value = []
-
-        mock_playwright = AsyncMock()
-        mock_playwright.chromium.launch_persistent_context.return_value = mock_context
-        mock_playwright.__aenter__.return_value = mock_playwright
+        mock_context.close = AsyncMock()
 
         with (
-            patch("playwright.async_api.async_playwright", return_value=mock_playwright),
-            patch.object(self.main, "find_chrome_executable", return_value="C:/chrome.exe"),
+            patch("src.main.cloakbrowser_launch_persistent_context_async", return_value=mock_context),
             patch.object(self.main, "get_recaptcha_settings", return_value=("sitekey", "action")),
             patch.object(self.main, "_get_arena_context_cookies", AsyncMock(return_value=[])),
             patch.object(self.main, "_upsert_browser_session_into_config", return_value=False),
-            patch.object(self.main, "_maybe_apply_camoufox_window_mode", AsyncMock()),
+            patch.object(self.main, "_maybe_apply_cloakbrowser_window_mode", AsyncMock()),
             patch.object(self.main, "click_turnstile", AsyncMock(return_value=True)),
             patch.object(self.main.asyncio, "sleep", AsyncMock()),
         ):
@@ -88,14 +84,14 @@ class TestUserscriptProxyUrlNormalization(BaseBridgeTest):
 
         mock_browser = AsyncMock()
         mock_browser.new_context.return_value = mock_context
-        mock_browser.__aenter__.return_value = mock_browser
+        mock_browser.close = AsyncMock()
 
         with (
-            patch.object(self.main, "AsyncCamoufox", return_value=mock_browser),
+            patch.object(self.main, "cloakbrowser_launch_async", return_value=mock_browser),
             patch.object(self.main, "get_recaptcha_settings", return_value=("sitekey", "action")),
             patch.object(self.main, "_get_arena_context_cookies", AsyncMock(return_value=[])),
             patch.object(self.main, "_upsert_browser_session_into_config", return_value=False),
-            patch.object(self.main, "_maybe_apply_camoufox_window_mode", AsyncMock()),
+            patch.object(self.main, "_maybe_apply_cloakbrowser_window_mode", AsyncMock()),
             patch.object(self.main, "click_turnstile", AsyncMock(return_value=True)),
             patch.object(self.main.asyncio, "sleep", AsyncMock()),
         ):

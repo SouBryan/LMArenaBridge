@@ -1,20 +1,16 @@
 import unittest
-from unittest.mock import AsyncMock, patch, MagicMock
-import asyncio
-from http import HTTPStatus
+from unittest.mock import AsyncMock, patch
 
 class TestChromeFetchRobustness(unittest.IsolatedAsyncioTestCase):
     async def test_fetch_via_chrome_retries_cloudflare(self):
         from src import main
-        
-        # Mock playwright
+
         mock_page = AsyncMock()
         mock_page.title.side_effect = [
             "Just a moment...", 
             "Just a moment...", 
             "LMArena"
         ]
-        # Mock fetch result
         mock_page.evaluate.side_effect = [
             "user-agent", # for UA check (initial)
             "recaptcha-token", # for _mint_recaptcha_v3_token
@@ -24,13 +20,9 @@ class TestChromeFetchRobustness(unittest.IsolatedAsyncioTestCase):
         mock_context = AsyncMock()
         mock_context.new_page.return_value = mock_page
         mock_context.cookies.return_value = []
-        
-        mock_playwright = AsyncMock()
-        mock_playwright.chromium.launch_persistent_context.return_value = mock_context
-        mock_playwright.__aenter__.return_value = mock_playwright
+        mock_context.close = AsyncMock()
 
-        with patch("playwright.async_api.async_playwright", return_value=mock_playwright), \
-             patch("src.main.find_chrome_executable", return_value="/path/to/chrome"), \
+        with patch("src.main.cloakbrowser_launch_persistent_context_async", return_value=mock_context), \
              patch("src.main.get_config", return_value={}), \
              patch("src.main.get_recaptcha_settings", return_value=("key", "action")), \
              patch("src.main.click_turnstile", AsyncMock(return_value=True)) as mock_click, \
@@ -70,14 +62,9 @@ class TestChromeFetchRobustness(unittest.IsolatedAsyncioTestCase):
         mock_context = AsyncMock()
         mock_context.new_page.return_value = mock_page
         mock_context.cookies.return_value = []
+        mock_context.close = AsyncMock()
 
-        mock_playwright = AsyncMock()
-        mock_playwright.chromium.launch_persistent_context.return_value = mock_context
-        mock_playwright.__aenter__.return_value = mock_playwright
-
-        with patch("playwright.async_api.async_playwright", return_value=mock_playwright), patch(
-            "src.main.find_chrome_executable", return_value="/path/to/chrome"
-        ), patch("src.main.get_config", return_value={}), patch(
+        with patch("src.main.cloakbrowser_launch_persistent_context_async", return_value=mock_context), patch("src.main.get_config", return_value={}), patch(
             "src.main.get_recaptcha_settings", return_value=("key", "action")
         ), patch(
             "src.main.click_turnstile", AsyncMock(return_value=True)
