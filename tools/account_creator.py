@@ -1,12 +1,17 @@
 """
 LMArena Account Creator — Batch token farming for LMArenaBridge.
 
-Creates anonymous LMArena accounts via CloakBrowser and harvests
-arena-auth-prod-v1 tokens. Rotates IPv6 residencial between accounts.
+Creates LMArena accounts via CloakBrowser and harvests
+arena-auth-prod-v1 tokens. Supports both anonymous and email-verified modes.
 
 Usage:
+    # Anonymous accounts (fast, no email needed)
     python -m tools.account_creator --count 5
-    python -m tools.account_creator --count 3 --delay 15
+
+    # Email-verified accounts (uses @duck.com + mail.tm)
+    python -m tools.account_creator --count 3 --verified
+
+    # Without IPv6 rotation
     python -m tools.account_creator --count 1 --no-ipv6
 """
 
@@ -14,10 +19,13 @@ import asyncio
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import uuid
 import base64
+import random
+import string
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -34,6 +42,12 @@ except ImportError:
     print("ERROR: cloakbrowser not installed. Run: pip install cloakbrowser")
     sys.exit(1)
 
+try:
+    import httpx
+except ImportError:
+    print("ERROR: httpx not installed. Run: pip install httpx")
+    sys.exit(1)
+
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -45,6 +59,14 @@ TURNSTILE_SITEKEY = "0x4AAAAAAA65vWDmG-O_lPtT"
 RECAPTCHA_SITEKEY = "6Led_uYrAAAAAIP_9E8Ais_67Z6Vp4vdf40p8SQU"
 RECAPTCHA_ACTION = "sign_up"
 ARENA_URL = "https://arena.ai/?mode=direct"
+
+# DuckDuckGo Email Protection
+DDG_API_URL = "https://quack.duckduckgo.com/api/email/addresses"
+
+# Mail.tm (for receiving forwarded @duck.com emails)
+MAILTM_API_URL = "https://api.mail.tm"
+EMAIL_POLL_INTERVAL = 3  # seconds between inbox checks
+EMAIL_POLL_TIMEOUT = 120  # max wait for verification email
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +549,338 @@ async def create_one_account(*, proxy_url: Optional[str] = None) -> Optional[str
 
 
 # ---------------------------------------------------------------------------
+# DuckDuckGo Email Protection (generates @duck.com aliases)
+# ---------------------------------------------------------------------------
+
+class DuckEmailService:
+    """Generates @duck.com aliases via DuckDuckGo Email Protection API."""
+
+    def __init__(self, token: str):
+        self._token = token
+
+    async def generate_alias(self) -> str:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(
+                DDG_API_URL,
+                headers={
+                    "Authorization": f"Bearer {self._token}",
+                    "Content-Type": "application/json",
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            address = data.get("address", "")
+            if not address:
+                raise ValueError(f"DDG API returned no address: {data}")
+            return f"{address}@duck.com"
+
+
+# ---------------------------------------------------------------------------
+# Mail.tm inbox reader (receives forwarded @duck.com emails)
+# ---------------------------------------------------------------------------
+
+class MailTmInbox:
+    """Reads emails from a mail.tm account to get verification links."""
+
+    def __init__(self, email: str, password: str):
+        self._email = email
+        self._password = password
+        self._token = ""
+
+    async def login(self) -> bool:
+        async with httpx.AsyncClient(base_url=MAILTM_API_URL, timeout=30.0) as client:
+            try:
+                resp = await client.post("/token", json={
+                    "address": self._email,
+                    "password": self._password,
+                })
+                resp.raise_for_status()
+                self._token = resp.json().get("token", "")
+                return bool(self._token)
+            except Exception as e:
+                log(f"  ❌ Mail.tm login failed: {e}")
+                return False
+
+    async def wait_for_magic_link(self, target_email: str, timeout: int = EMAIL_POLL_TIMEOUT) -> Optional[str]:
+        """
+        Poll inbox until we receive the LMArena magic link email.
+        
+        Returns the verification URL or None on timeout.
+        """
+        if not self._token:
+            if not await self.login():
+                return None
+
+        start = time.time()
+        checked_ids: set[str] = set()
+        headers = {"Authorization": f"Bearer {self._token}"}
+
+        log(f"  📬 Polling inbox for magic link (timeout {timeout}s)...")
+
+        async with httpx.AsyncClient(base_url=MAILTM_API_URL, timeout=30.0) as client:
+            while time.time() - start < timeout:
+                try:
+                    resp = await client.get("/messages", headers=headers)
+                    if resp.status_code == 401:
+                        # Token expired, re-login
+                        if not await self.login():
+                            return None
+                        headers = {"Authorization": f"Bearer {self._token}"}
+                        continue
+                    resp.raise_for_status()
+                    data = resp.json()
+
+                    messages = data.get("hydra:member", data) if isinstance(data, dict) else data
+                    if not isinstance(messages, list):
+                        messages = []
+
+                    for msg in messages:
+                        msg_id = msg.get("id", "")
+                        if msg_id in checked_ids:
+                            continue
+                        checked_ids.add(msg_id)
+
+                        # Check if this is from LMArena/Supabase
+                        from_addr = msg.get("from", {})
+                        if isinstance(from_addr, dict):
+                            from_email = from_addr.get("address", "").lower()
+                        else:
+                            from_email = str(from_addr).lower()
+                        subject = str(msg.get("subject", "")).lower()
+
+                        is_verification = (
+                            "arena" in from_email or
+                            "supabase" in from_email or
+                            "verify" in subject or
+                            "confirm" in subject or
+                            "magic" in subject or
+                            "sign in" in subject or
+                            "log in" in subject
+                        )
+
+                        if not is_verification:
+                            continue
+
+                        # Get full message
+                        detail_resp = await client.get(f"/messages/{msg_id}", headers=headers)
+                        detail_resp.raise_for_status()
+                        detail = detail_resp.json()
+
+                        # Check if this email is for our target alias
+                        text_body = detail.get("text", "")
+                        html_body = ""
+                        html_parts = detail.get("html", [])
+                        if isinstance(html_parts, list):
+                            html_body = "".join(html_parts)
+                        elif isinstance(html_parts, str):
+                            html_body = html_parts
+
+                        # Some forwarded emails include the original recipient
+                        full_content = text_body + html_body
+                        # Extract magic link
+                        link = self._extract_magic_link(full_content)
+                        if link:
+                            log(f"  📩 Magic link found! From: {from_email}")
+                            return link
+
+                except httpx.HTTPStatusError as e:
+                    if e.response.status_code == 401:
+                        await self.login()
+                        headers = {"Authorization": f"Bearer {self._token}"}
+                    else:
+                        log(f"  ⚠️ Inbox poll error: {e}")
+                except Exception as e:
+                    log(f"  ⚠️ Inbox poll error: {e}")
+
+                elapsed = int(time.time() - start)
+                if elapsed % 15 == 0 and elapsed > 0:
+                    log(f"  ⏳ Still waiting... ({elapsed}s / {timeout}s)")
+
+                await asyncio.sleep(EMAIL_POLL_INTERVAL)
+
+        log(f"  ⏰ Timeout: No magic link received in {timeout}s")
+        return None
+
+    @staticmethod
+    def _extract_magic_link(content: str) -> Optional[str]:
+        """Extract verification/magic link from email content."""
+        # Patterns for Supabase magic links
+        patterns = [
+            # Standard Supabase verify link
+            r'(https?://[^\s<>"\']+/auth/v1/verify[^\s<>"\']*)',
+            # arena.ai specific auth confirm
+            r'(https?://[^\s<>"\']*arena\.ai[^\s<>"\']*(?:confirm|verify|callback|token)[^\s<>"\']*)',
+            # Generic supabase auth links
+            r'(https?://[^\s<>"\']*supabase[^\s<>"\']*(?:verify|confirm|token_hash)[^\s<>"\']*)',
+            # href links with verify/confirm
+            r'href=["\']([^"\']*(?:verify|confirm|magic|token_hash|auth/callback)[^"\']*)["\']',
+        ]
+        for pattern in patterns:
+            matches = re.findall(pattern, content, re.IGNORECASE)
+            if matches:
+                link = matches[0]
+                # Clean HTML entities
+                link = link.replace("&amp;", "&")
+                return link
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Verified account creation (email + magic link)
+# ---------------------------------------------------------------------------
+
+async def create_one_verified_account(
+    *,
+    proxy_url: Optional[str] = None,
+    duck_email_service: Optional[DuckEmailService] = None,
+    inbox: Optional[MailTmInbox] = None,
+) -> Optional[str]:
+    """
+    Create a verified LMArena account using @duck.com email + magic link.
+
+    Flow:
+    1. Generate @duck.com alias
+    2. POST /nextjs-api/sign-up/magic-link with email
+    3. Poll mail.tm inbox for verification email  
+    4. Follow the magic link in CloakBrowser to get the auth cookie
+    
+    Returns the arena-auth-prod-v1 token or None on failure.
+    """
+    if not duck_email_service or not inbox:
+        log("  ❌ Duck email service and inbox required for verified mode")
+        return None
+
+    # Step 1: Generate @duck.com alias
+    log("  🦆 Generating @duck.com alias...")
+    try:
+        email = await duck_email_service.generate_alias()
+    except Exception as e:
+        log(f"  ❌ Failed to generate duck alias: {e}")
+        return None
+    log(f"  📧 Email: {email}")
+
+    # Generate random name
+    first_names = ["Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Sam", "Jamie", "Quinn", "Avery"]
+    last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Davis", "Miller", "Wilson", "Moore", "Clark"]
+    full_name = f"{random.choice(first_names)} {random.choice(last_names)}"
+
+    # Step 2: Call /nextjs-api/sign-up/magic-link via httpx (no browser needed!)
+    log("  📝 Calling /nextjs-api/sign-up/magic-link...")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                "https://arena.ai/nextjs-api/sign-up/magic-link",
+                json={
+                    "email": email,
+                    "fullName": full_name,
+                    "shouldLinkHistory": True,
+                    "marketingConsent": False,
+                    "registeredCountryCode": "BR",
+                },
+                headers={"Content-Type": "application/json"},
+            )
+            status = resp.status_code
+            body = resp.text
+    except Exception as e:
+        log(f"  ❌ Magic link request failed: {e}")
+        return None
+
+    log(f"  📡 Response: HTTP {status}")
+    if status >= 400:
+        log(f"  ❌ Error: {body[:200]}")
+        return None
+
+    try:
+        resp_data = json.loads(body)
+        if not resp_data.get("success"):
+            log(f"  ❌ API returned success=false: {body[:200]}")
+            return None
+    except Exception:
+        pass
+
+    log("  ✅ Magic link email sent!")
+
+    # Step 3: Wait for email and extract magic link
+    magic_link = await inbox.wait_for_magic_link(email, timeout=EMAIL_POLL_TIMEOUT)
+    if not magic_link:
+        log("  ❌ Did not receive magic link email")
+        return None
+    log(f"  🔗 Magic link: {magic_link[:80]}...")
+
+    # Step 4: Open magic link in CloakBrowser to get the auth cookie
+    log("  🌐 Opening magic link in CloakBrowser...")
+    launch_kwargs = {"headless": True}
+    if proxy_url:
+        launch_kwargs["proxy"] = proxy_url
+
+    browser = await cloakbrowser_launch_async(**launch_kwargs)
+    try:
+        page = await browser.new_page()
+        await page.goto(magic_link, wait_until="domcontentloaded", timeout=60000)
+
+        # Wait for Cloudflare if needed
+        for i in range(10):
+            title = await page.title()
+            if "Just a moment" not in title:
+                break
+            await click_turnstile_widget(page)
+            await asyncio.sleep(2)
+
+        # Wait for redirect and cookie to be set
+        await asyncio.sleep(5)
+
+        # Extract the auth cookie
+        context = page.context
+        token = await get_auth_cookie_from_context(context, page)
+        if token and is_token_valid(token):
+            log("  ✅ Got verified auth token from cookie!")
+            return token
+
+        # Sometimes the page needs more time or does a JS redirect
+        for _ in range(15):
+            await asyncio.sleep(2)
+            token = await get_auth_cookie_from_context(context, page)
+            if token and is_token_valid(token):
+                log("  ✅ Got verified auth token from cookie (delayed)!")
+                return token
+
+        # Last resort: check if the URL has token info
+        current_url = page.url
+        log(f"  ⚠️ Final URL: {current_url[:100]}")
+
+        # Check if there's a hash fragment with tokens (Supabase PKCE flow)
+        if "#" in current_url:
+            fragment = current_url.split("#", 1)[1]
+            params = dict(p.split("=", 1) for p in fragment.split("&") if "=" in p)
+            access_token = params.get("access_token", "")
+            refresh_token = params.get("refresh_token", "")
+            if access_token and refresh_token:
+                expires_in = int(params.get("expires_in", 3600))
+                session = {
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "expires_at": int(time.time()) + expires_in,
+                    "expires_in": expires_in,
+                    "token_type": "bearer",
+                }
+                raw = json.dumps(session, separators=(",", ":")).encode("utf-8")
+                b64 = base64.b64encode(raw).decode("utf-8").rstrip("=")
+                token = "base64-" + b64
+                if is_token_valid(token):
+                    log("  ✅ Got verified auth token from URL fragment!")
+                    return token
+
+        log("  ❌ Could not extract token after following magic link")
+        return None
+
+    finally:
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Batch creation with optional IPv6 rotation
 # ---------------------------------------------------------------------------
 
@@ -534,12 +888,42 @@ async def create_accounts(
     count: int = 1,
     delay_seconds: float = 10.0,
     use_ipv6: bool = True,
+    verified: bool = False,
 ) -> list[str]:
     """Create N accounts and return list of tokens."""
     tokens: list[str] = []
     rotator: Optional[IPRotator] = None
+    duck_service: Optional[DuckEmailService] = None
+    inbox: Optional[MailTmInbox] = None
 
-    log(f"🚀 Starting batch creation of {count} account(s)")
+    mode_str = "verified (email)" if verified else "anonymous"
+    log(f"🚀 Starting batch creation of {count} {mode_str} account(s)")
+
+    # Setup email services for verified mode
+    if verified:
+        config = load_config()
+        ddg_token = config.get("ddg_email_token", "").strip()
+        mailtm_email = config.get("mailtm_email", "").strip()
+        mailtm_password = config.get("mailtm_password", "").strip()
+
+        if not ddg_token:
+            log("  ❌ ddg_email_token not found in config.json!")
+            log("     Add: \"ddg_email_token\": \"your-duckduckgo-token\"")
+            return []
+        if not mailtm_email or not mailtm_password:
+            log("  ❌ mailtm_email / mailtm_password not found in config.json!")
+            log("     Add: \"mailtm_email\": \"your@mail.tm\", \"mailtm_password\": \"pass\"")
+            return []
+
+        duck_service = DuckEmailService(token=ddg_token)
+        inbox = MailTmInbox(email=mailtm_email, password=mailtm_password)
+
+        # Test inbox login
+        log("  🔑 Testing mail.tm login...")
+        if not await inbox.login():
+            log("  ❌ Cannot connect to mail.tm inbox")
+            return []
+        log("  ✅ Mail.tm connected")
 
     # Setup IPv6 rotation
     if use_ipv6:
@@ -556,7 +940,7 @@ async def create_accounts(
 
     try:
         for i in range(count):
-            log(f"━━━ Account {i+1}/{count} ━━━")
+            log(f"━━━ Account {i+1}/{count} ({mode_str}) ━━━")
 
             # Rotate IPv6 for each account (except first, already rotated on start)
             if rotator and i > 0:
@@ -567,11 +951,19 @@ async def create_accounts(
             proxy_url = rotator.proxy_url if rotator else None
 
             try:
-                token = await create_one_account(proxy_url=proxy_url)
+                if verified:
+                    token = await create_one_verified_account(
+                        proxy_url=proxy_url,
+                        duck_email_service=duck_service,
+                        inbox=inbox,
+                    )
+                else:
+                    token = await create_one_account(proxy_url=proxy_url)
+
                 if token:
                     tokens.append(token)
                     add_token_to_config(token)
-                    save_account(token, f"batch-{i+1}")
+                    save_account(token, f"{'verified' if verified else 'anon'}-{i+1}")
                     expiry = decode_token_expiry(token)
                     if expiry:
                         exp_str = datetime.fromtimestamp(expiry, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -612,23 +1004,29 @@ def main():
     parser.add_argument("--count", "-n", type=int, default=1, help="Number of accounts to create")
     parser.add_argument("--delay", "-d", type=float, default=10.0, help="Delay between accounts (seconds)")
     parser.add_argument("--no-ipv6", action="store_true", help="Disable IPv6 rotation (use direct IP)")
+    parser.add_argument("--verified", "-v", action="store_true",
+                        help="Create email-verified accounts via @duck.com + magic link")
 
     args = parser.parse_args()
 
-    print("""
+    mode = "Email-Verified (@duck.com)" if args.verified else "Anonymous"
+    print(f"""
 ╔══════════════════════════════════════════╗
 ║     LMArena Account Creator              ║
-║     CloakBrowser + IPv6 Rotation         ║
+║     Mode: {mode:<30}║
 ╚══════════════════════════════════════════╝
 """)
 
-    log(f"Config: count={args.count}, delay={args.delay}s, ipv6={'off' if args.no_ipv6 else 'on'}")
+    log(f"Config: count={args.count}, delay={args.delay}s, ipv6={'off' if args.no_ipv6 else 'on'}, verified={args.verified}")
+    if args.verified:
+        log("  📋 Requires in config.json: ddg_email_token, mailtm_email, mailtm_password")
     log("")
 
     tokens = asyncio.run(create_accounts(
         count=args.count,
         delay_seconds=args.delay,
         use_ipv6=not args.no_ipv6,
+        verified=args.verified,
     ))
 
     sys.exit(0 if tokens else 1)
