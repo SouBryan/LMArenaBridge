@@ -449,7 +449,7 @@ def _arena_auth_cookie_specs(token: str, *, page_url: Optional[str] = None) -> l
         return []
     specs: list[dict] = []
     for origin in _arena_origin_candidates(page_url):
-        specs.append({"name": "arena-auth-prod-v1", "value": value, "url": origin, "path": "/"})
+        specs.append({"name": "arena-auth-prod-v1", "value": value, "url": origin})
     return specs
 
 
@@ -464,7 +464,8 @@ def _provisional_user_id_cookie_specs(provisional_user_id: str, *, page_url: Opt
         return []
     specs: list[dict] = []
     for origin in _arena_origin_candidates(page_url):
-        specs.append({"name": "provisional_user_id", "value": value, "url": origin, "path": "/"})
+        # url alone is sufficient; Playwright infers domain+path from it.
+        specs.append({"name": "provisional_user_id", "value": value, "url": origin})
     for domain in (".lmarena.ai", ".arena.ai"):
         # domain + path is the correct combo (url is mutually exclusive with domain)
         specs.append({"name": "provisional_user_id", "value": value, "domain": domain, "path": "/"})
@@ -2040,6 +2041,9 @@ async def cloakbrowser_proxy_worker():
                         _m().debug_print("🔒 CloakBrowser proxy: initial cookies saved to config.")
                 except Exception:
                     pass
+
+                # Keep poll timestamp fresh after long browser setup so main.py detects us as active.
+                _touch_userscript_poll()
 
             async def _get_auth_cookie_value() -> str:
                 nonlocal context, page
