@@ -558,77 +558,66 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
         except Exception:
             pass
 
-        # Wait for grecaptcha library (arena.ai lazy-loads it).
-        # If not found quickly, inject it ourselves.
-        try:
-            await page.wait_for_function(
-                "window.grecaptcha && ("
-                "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
-                "typeof window.grecaptcha.execute === 'function'"
-                ")",
-                timeout=15000,
-            )
-        except Exception:
-            _m().debug_print("  ⚠️ grecaptcha not found naturally, injecting scripts...")
-            inject_js = f"""() => {{
-                if (window.__LM_BRIDGE_RECAPTCHA_INJECTED) return true;
-                window.__LM_BRIDGE_RECAPTCHA_INJECTED = true;
-                const h = document.head;
-                if (!h) return false;
-                const urls = [
-                    'https://www.google.com/recaptcha/enterprise.js?render={recaptcha_sitekey}',
-                    'https://www.google.com/recaptcha/api.js?render={recaptcha_sitekey}',
-                ];
-                for (const u of urls) {{
-                    const s = document.createElement('script');
-                    s.src = u;
-                    s.async = true;
-                    h.appendChild(s);
-                }}
-                return true;
-            }}"""
-            await page.evaluate(inject_js)
-            # Wait for library to become available after injection
-            await page.wait_for_function(
-                "window.grecaptcha && ("
-                "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
-                "typeof window.grecaptcha.execute === 'function'"
-                ")",
-                timeout=30000,
-            )
+        # The mint_js below handles everything: injects scripts if needed,
+        # polls for .execute() readiness, and calls grecaptcha.ready() before minting.
+        # No need for separate wait_for_function here.
 
-        # Retry evaluate with delays — arena.ai SPA navigation can destroy context temporarily
-        mint_js = """({sitekey, action}) => new Promise((resolve, reject) => {
-              const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
-                ? window.grecaptcha.enterprise
-                : window.grecaptcha;
-              if (!g || typeof g.execute !== 'function') return reject('NO_GRECAPTCHA');
-              try {
-                g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
-              } catch (e) { reject(String(e)); }
-            })"""
-        
-        token = None
-        for attempt in range(4):
-            await asyncio.sleep(2 + attempt * 2)  # 2s, 4s, 6s, 8s
-            try:
-                token = await page.evaluate(mint_js, {"sitekey": recaptcha_sitekey, "action": recaptcha_action})
-                if isinstance(token, str) and token:
-                    _m().debug_print(f"  ✅ Chrome reCAPTCHA token acquired (attempt {attempt + 1})")
-                    return token
-            except Exception as e:
-                _m().debug_print(f"  ⚠️ Chrome evaluate attempt {attempt + 1}/4 failed: {e}")
-                if attempt < 3:
-                    # Re-inject scripts in case context was destroyed
-                    try:
-                        await page.evaluate(f"""() => {{
-                            if (window.grecaptcha?.enterprise?.execute) return;
-                            const s = document.createElement('script');
-                            s.src = 'https://www.google.com/recaptcha/enterprise.js?render={recaptcha_sitekey}';
-                            document.head.appendChild(s);
-                        }}""")
-                    except Exception:
-                        pass
+        # Mint token using grecaptcha.ready() to wait for full initialization.
+        # Arena.ai loads the namespace early but .execute() becomes available later.
+        mint_js = f"""() => new Promise((resolve, reject) => {{
+              const timeout = setTimeout(() => reject('TIMEOUT_60s'), 60000);
+              
+              function tryMint() {{
+                const ent = window.grecaptcha?.enterprise;
+                const g = (ent && typeof ent.execute === 'function') ? ent : window.grecaptcha;
+                if (!g || typeof g.execute !== 'function') return false;
+                
+                const readyFn = g.ready || ((cb) => cb());
+                readyFn(() => {{
+                  try {{
+                    g.execute('{recaptcha_sitekey}', {{ action: '{recaptcha_action}' }})
+                      .then((t) => {{ clearTimeout(timeout); resolve(t); }})
+                      .catch((e) => {{ clearTimeout(timeout); reject(String(e)); }});
+                  }} catch (e) {{ clearTimeout(timeout); reject(String(e)); }}
+                }});
+                return true;
+              }}
+              
+              // If already ready, mint immediately
+              if (tryMint()) return;
+              
+              // Inject scripts and poll
+              const urls = [
+                'https://www.google.com/recaptcha/enterprise.js?render={recaptcha_sitekey}',
+                'https://www.google.com/recaptcha/api.js?render={recaptcha_sitekey}',
+              ];
+              for (const u of urls) {{
+                if (!document.querySelector('script[src*="recaptcha"]')) {{
+                  const s = document.createElement('script');
+                  s.src = u;
+                  s.async = true;
+                  document.head.appendChild(s);
+                }}
+              }}
+              
+              // Poll until ready
+              const interval = setInterval(() => {{
+                if (tryMint()) clearInterval(interval);
+              }}, 1000);
+            }})"""
+
+        try:
+            token = await asyncio.wait_for(
+                page.evaluate(mint_js),
+                timeout=70.0,
+            )
+            if isinstance(token, str) and token:
+                _m().debug_print(f"  ✅ Chrome reCAPTCHA token acquired! ({len(token)} chars)")
+                return token
+        except asyncio.TimeoutError:
+            _m().debug_print("  ❌ Chrome reCAPTCHA evaluate timed out (70s)")
+        except Exception as e:
+            _m().debug_print(f"  ⚠️ Chrome reCAPTCHA evaluate failed: {e}")
         return None
     except Exception as e:
         _m().debug_print(f"⚠️ Chrome reCAPTCHA retrieval failed: {e}")
