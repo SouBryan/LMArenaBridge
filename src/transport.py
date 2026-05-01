@@ -466,8 +466,8 @@ def _provisional_user_id_cookie_specs(provisional_user_id: str, *, page_url: Opt
     for origin in _arena_origin_candidates(page_url):
         specs.append({"name": "provisional_user_id", "value": value, "url": origin, "path": "/"})
     for domain in (".lmarena.ai", ".arena.ai"):
-        # When using domain, do NOT include path - they're mutually exclusive in Playwright
-        specs.append({"name": "provisional_user_id", "value": value, "domain": domain})
+        # domain + path is the correct combo (url is mutually exclusive with domain)
+        specs.append({"name": "provisional_user_id", "value": value, "domain": domain, "path": "/"})
 
     return specs
 
@@ -635,7 +635,7 @@ async def fetch_lmarena_stream_via_chrome(
     for value, name in cookie_definitions:
         if value:
             for _domain in (".lmarena.ai", ".arena.ai"):
-                desired_cookies.append({"name": name, "value": value, "domain": _domain})
+                desired_cookies.append({"name": name, "value": value, "domain": _domain, "path": "/"})
     
     if auth_token:
         desired_cookies.extend(_arena_auth_cookie_specs(auth_token))
@@ -1123,7 +1123,7 @@ async def fetch_lmarena_stream_via_cloakbrowser(
     for value, name in cookie_definitions:
         if value:
             for _domain in (".lmarena.ai", ".arena.ai"):
-                desired_cookies.append({"name": name, "value": value, "domain": _domain})
+                desired_cookies.append({"name": name, "value": value, "domain": _domain, "path": "/"})
     
     if auth_token:
         desired_cookies.extend(_arena_auth_cookie_specs(auth_token))
@@ -1881,7 +1881,7 @@ async def cloakbrowser_proxy_worker():
                 for value, name in cookie_definitions:
                     if value:
                         for _domain in (".lmarena.ai", ".arena.ai"):
-                            desired_cookies.append({"name": name, "value": value, "domain": _domain})
+                            desired_cookies.append({"name": name, "value": value, "domain": _domain, "path": "/"})
                 if desired_cookies:
                     try:
                         existing_names: set[str] = set()
