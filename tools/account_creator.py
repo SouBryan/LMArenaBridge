@@ -104,7 +104,7 @@ def add_token_to_config(token: str) -> None:
         log(f"  ✅ Token added to config.json ({len(tokens)} total)")
 
 
-def save_account(token: str, provisional_id: str) -> None:
+def save_account(token: str, provisional_id: str, *, email: str = "", password: str = "") -> None:
     """Save account metadata for reference."""
     ACCOUNTS_FILE.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -113,12 +113,18 @@ def save_account(token: str, provisional_id: str) -> None:
     except (FileNotFoundError, json.JSONDecodeError):
         data = {"accounts": [], "last_updated": None}
 
-    data["accounts"].append({
+    entry = {
         "provisional_user_id": provisional_id,
         "token_prefix": token[:40] + "...",
         "created_at": datetime.now(timezone.utc).isoformat(),
         "status": "active",
-    })
+    }
+    if email:
+        entry["email"] = email
+    if password:
+        entry["password"] = password
+
+    data["accounts"].append(entry)
     data["last_updated"] = datetime.now(timezone.utc).isoformat()
 
     with open(ACCOUNTS_FILE, "w") as f:
@@ -729,6 +735,25 @@ class MailTmInbox:
 # Verified account creation (email + magic link)
 # ---------------------------------------------------------------------------
 
+def _generate_password(length: int = 16) -> str:
+    """Generate a strong random password for the account."""
+    chars = string.ascii_letters + string.digits + "!@#$%&*"
+    # Ensure at least one of each type
+    pwd = [
+        random.choice(string.ascii_uppercase),
+        random.choice(string.ascii_lowercase),
+        random.choice(string.digits),
+        random.choice("!@#$%&*"),
+    ]
+    pwd += [random.choice(chars) for _ in range(length - 4)]
+    random.shuffle(pwd)
+    return "".join(pwd)
+
+
+# Store last created account credentials (used by batch loop)
+_last_account_credentials: dict = {}
+
+
 async def create_one_verified_account(
     *,
     proxy_url: Optional[str] = None,
@@ -759,9 +784,37 @@ async def create_one_verified_account(
         return None
     log(f"  📧 Email: {email}")
 
+    # Store credentials for later retrieval
+    account_password = _generate_password()
+    _last_account_credentials.clear()
+    _last_account_credentials["email"] = email
+    _last_account_credentials["password"] = account_password
+
     # Generate random name
-    first_names = ["Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Sam", "Jamie", "Quinn", "Avery"]
-    last_names = ["Smith", "Johnson", "Williams", "Brown", "Jones", "Davis", "Miller", "Wilson", "Moore", "Clark"]
+    first_names = [
+        "Alex", "Jordan", "Taylor", "Morgan", "Casey", "Riley", "Sam", "Jamie", "Quinn", "Avery",
+        "Charlie", "Dakota", "Emerson", "Finley", "Harper", "Hayden", "Jesse", "Kai", "Logan", "Parker",
+        "Peyton", "Reese", "River", "Rowan", "Sage", "Skyler", "Spencer", "Blake", "Cameron", "Drew",
+        "Ellis", "Gray", "Harley", "Jaden", "Kennedy", "Lane", "Marlowe", "Nico", "Phoenix", "Remy",
+        "Sawyer", "Tatum", "Wren", "Addison", "Bailey", "Corey", "Devon", "Eden", "Frankie", "Gage",
+        "Hollis", "Indigo", "Jules", "Kit", "Lennox", "Milan", "Noel", "Oakley", "Paxton", "Raven",
+        "Daniel", "Michael", "James", "Robert", "David", "William", "Lucas", "Henry", "Nathan", "Owen",
+        "Emma", "Olivia", "Sophia", "Isabella", "Mia", "Charlotte", "Amelia", "Luna", "Ella", "Chloe",
+        "Ethan", "Mason", "Liam", "Noah", "Oliver", "Benjamin", "Elijah", "Aiden", "Jackson", "Carter",
+        "Grace", "Lily", "Zoe", "Hannah", "Aria", "Layla", "Nora", "Riley", "Stella", "Violet",
+    ]
+    last_names = [
+        "Smith", "Johnson", "Williams", "Brown", "Jones", "Davis", "Miller", "Wilson", "Moore", "Clark",
+        "Taylor", "Anderson", "Thomas", "Jackson", "White", "Harris", "Martin", "Thompson", "Garcia", "Martinez",
+        "Robinson", "Lewis", "Lee", "Walker", "Hall", "Allen", "Young", "King", "Wright", "Scott",
+        "Torres", "Nguyen", "Hill", "Flores", "Green", "Adams", "Nelson", "Baker", "Rivera", "Mitchell",
+        "Campbell", "Carter", "Roberts", "Phillips", "Evans", "Turner", "Parker", "Collins", "Edwards", "Stewart",
+        "Morris", "Murphy", "Cook", "Rogers", "Morgan", "Peterson", "Cooper", "Reed", "Bailey", "Bell",
+        "Howard", "Ward", "Cox", "Richardson", "Wood", "Watson", "Brooks", "Bennett", "Gray", "Price",
+        "Sanders", "Powell", "Russell", "Foster", "Perry", "Butler", "Barnes", "Fisher", "Henderson", "Coleman",
+        "Jenkins", "Patterson", "Graham", "Reynolds", "Hamilton", "Griffin", "Wallace", "West", "Cole", "Hayes",
+        "Chapman", "Stone", "Fox", "Boyd", "Hart", "Mason", "Webb", "Burke", "Kelley", "Dunn",
+    ]
     full_name = f"{random.choice(first_names)} {random.choice(last_names)}"
 
     # Step 2: Call /nextjs-api/sign-up/magic-link via httpx (no browser needed!)
@@ -826,8 +879,35 @@ async def create_one_verified_account(
             await click_turnstile_widget(page)
             await asyncio.sleep(2)
 
-        # Wait for redirect and cookie to be set
+        # Wait for redirect
         await asyncio.sleep(5)
+
+        # Check if we landed on set-password page
+        current_url = page.url
+        if "/auth/set-password" in current_url or "set-password" in current_url:
+            log("  🔑 Redirected to set-password page, filling password...")
+            try:
+                # Wait for form to load
+                await page.wait_for_selector('input[type="password"]', timeout=10000)
+                
+                # Fill password fields
+                password_inputs = await page.locator('input[type="password"]').all()
+                for inp in password_inputs:
+                    await inp.fill(account_password)
+                    await asyncio.sleep(0.3)
+                
+                # Submit the form
+                submit_btn = page.locator('button[type="submit"]')
+                if await submit_btn.count() > 0:
+                    await submit_btn.first.click()
+                    log("  ✅ Password set, waiting for redirect...")
+                    await asyncio.sleep(5)
+                else:
+                    # Try pressing Enter
+                    await password_inputs[-1].press("Enter")
+                    await asyncio.sleep(5)
+            except Exception as e:
+                log(f"  ⚠️ Password form interaction failed: {e}")
 
         # Extract the auth cookie
         context = page.context
@@ -837,7 +917,7 @@ async def create_one_verified_account(
             return token
 
         # Sometimes the page needs more time or does a JS redirect
-        for _ in range(15):
+        for _ in range(10):
             await asyncio.sleep(2)
             token = await get_auth_cookie_from_context(context, page)
             if token and is_token_valid(token):
@@ -963,7 +1043,12 @@ async def create_accounts(
                 if token:
                     tokens.append(token)
                     add_token_to_config(token)
-                    save_account(token, f"{'verified' if verified else 'anon'}-{i+1}")
+                    creds = _last_account_credentials.copy() if verified else {}
+                    save_account(
+                        token, f"{'verified' if verified else 'anon'}-{i+1}",
+                        email=creds.get("email", ""),
+                        password=creds.get("password", ""),
+                    )
                     expiry = decode_token_expiry(token)
                     if expiry:
                         exp_str = datetime.fromtimestamp(expiry, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -1022,12 +1107,18 @@ def main():
         log("  📋 Requires in config.json: ddg_email_token, mailtm_email, mailtm_password")
     log("")
 
-    tokens = asyncio.run(create_accounts(
-        count=args.count,
-        delay_seconds=args.delay,
-        use_ipv6=not args.no_ipv6,
-        verified=args.verified,
-    ))
+    try:
+        tokens = asyncio.run(create_accounts(
+            count=args.count,
+            delay_seconds=args.delay,
+            use_ipv6=not args.no_ipv6,
+            verified=args.verified,
+        ))
+    except KeyboardInterrupt:
+        log("\n⚠️ Interrupted by user")
+        tokens = []
+    except (asyncio.CancelledError, SystemExit):
+        tokens = []
 
     sys.exit(0 if tokens else 1)
 
