@@ -558,13 +558,47 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
         except Exception:
             pass
 
-        await page.wait_for_function(
-            "window.grecaptcha && ("
-            "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
-            "typeof window.grecaptcha.execute === 'function'"
-            ")",
-            timeout=60000,
-        )
+        # Wait for grecaptcha library (arena.ai lazy-loads it).
+        # If not found quickly, inject it ourselves.
+        try:
+            await page.wait_for_function(
+                "window.grecaptcha && ("
+                "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
+                "typeof window.grecaptcha.execute === 'function'"
+                ")",
+                timeout=15000,
+            )
+        except Exception:
+            _m().debug_print("  ⚠️ grecaptcha not found naturally, injecting scripts...")
+            inject_js = f"""() => {{
+                if (window.__LM_BRIDGE_RECAPTCHA_INJECTED) return true;
+                window.__LM_BRIDGE_RECAPTCHA_INJECTED = true;
+                const h = document.head;
+                if (!h) return false;
+                const urls = [
+                    'https://www.google.com/recaptcha/enterprise.js?render={recaptcha_sitekey}',
+                    'https://www.google.com/recaptcha/api.js?render={recaptcha_sitekey}',
+                ];
+                for (const u of urls) {{
+                    const s = document.createElement('script');
+                    s.src = u;
+                    s.async = true;
+                    h.appendChild(s);
+                }}
+                return true;
+            }}"""
+            await page.evaluate(inject_js)
+            # Wait for library to become available after injection
+            await page.wait_for_function(
+                "window.grecaptcha && ("
+                "(window.grecaptcha.enterprise && typeof window.grecaptcha.enterprise.execute === 'function') || "
+                "typeof window.grecaptcha.execute === 'function'"
+                ")",
+                timeout=30000,
+            )
+
+        # Small stabilization delay before execute
+        await asyncio.sleep(1)
 
         token = await page.evaluate(
             """({sitekey, action}) => new Promise((resolve, reject) => {
@@ -695,14 +729,18 @@ async def get_recaptcha_v3_token() -> Optional[str]:
                         return true;
                     }}"""
                 await _m().safe_page_evaluate(page, inject_script)
-                # Wait for scripts to load
-                await asyncio.sleep(5)
-                lib_ready = await _m().safe_page_evaluate(
-                    page,
-                    "() => { const w = window.wrappedJSObject || window; return !!(w.grecaptcha && w.grecaptcha.enterprise); }",
-                )
+                # Poll for library to load (up to 20 seconds)
+                for _poll in range(10):
+                    await asyncio.sleep(2)
+                    lib_ready = await _m().safe_page_evaluate(
+                        page,
+                        "() => { const w = window.wrappedJSObject || window; return !!(w.grecaptcha && (w.grecaptcha.enterprise || typeof w.grecaptcha.execute === 'function')); }",
+                    )
+                    if lib_ready:
+                        _m().debug_print(f"  ✅ reCAPTCHA library loaded after {(_poll + 1) * 2}s")
+                        break
                 if not lib_ready:
-                    _m().debug_print("❌ reCAPTCHA library still not loaded after injection.")
+                    _m().debug_print("❌ reCAPTCHA library still not loaded after injection (20s).")
                     return None
 
             # 3. Execute reCAPTCHA using await (more reliable than Promise callbacks)
