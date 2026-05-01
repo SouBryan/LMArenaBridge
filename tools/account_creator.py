@@ -2,7 +2,7 @@
 LMArena Account Creator — Batch token farming for LMArenaBridge.
 
 Creates anonymous LMArena accounts via CloakBrowser and harvests
-arena-auth-prod-v1 tokens. Supports IPv6 rotation between accounts.
+arena-auth-prod-v1 tokens. Rotates IPv6 residencial between accounts.
 
 Usage:
     python -m tools.account_creator --count 5
@@ -25,6 +25,8 @@ from typing import Optional
 # Add project root to path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+
+from tools.ip_rotator import IPRotator
 
 try:
     from cloakbrowser import launch_async as cloakbrowser_launch_async
@@ -531,37 +533,63 @@ async def create_one_account(*, proxy_url: Optional[str] = None) -> Optional[str
 async def create_accounts(
     count: int = 1,
     delay_seconds: float = 10.0,
-    proxy_url: Optional[str] = None,
+    use_ipv6: bool = True,
 ) -> list[str]:
     """Create N accounts and return list of tokens."""
     tokens: list[str] = []
+    rotator: Optional[IPRotator] = None
 
     log(f"🚀 Starting batch creation of {count} account(s)")
-    if proxy_url:
-        log(f"  🌐 Using proxy: {proxy_url}")
+
+    # Setup IPv6 rotation
+    if use_ipv6:
+        rotator = IPRotator(port=40000)
+        log("  🌐 Iniciando rotação de IPv6 residencial...")
+        ok = await rotator.start()
+        if ok:
+            log(f"  ✅ IPv6 ativo: {rotator.current_ipv6}")
+            log(f"  🔌 Proxy: {rotator.proxy_url}")
+        else:
+            log("  ⚠️ IPv6 indisponível, continuando sem rotação")
+            rotator = None
     log("")
 
-    for i in range(count):
-        log(f"━━━ Account {i+1}/{count} ━━━")
-        try:
-            token = await create_one_account(proxy_url=proxy_url)
-            if token:
-                tokens.append(token)
-                add_token_to_config(token)
-                save_account(token, f"batch-{i+1}")
-                expiry = decode_token_expiry(token)
-                if expiry:
-                    exp_str = datetime.fromtimestamp(expiry, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                    log(f"  📅 Token expires: {exp_str}")
-            else:
-                log("  ❌ Account creation failed")
-        except Exception as e:
-            log(f"  ❌ Exception: {type(e).__name__}: {e}")
+    try:
+        for i in range(count):
+            log(f"━━━ Account {i+1}/{count} ━━━")
 
-        if i < count - 1:
-            log(f"  ⏳ Waiting {delay_seconds}s before next account...")
-            await asyncio.sleep(delay_seconds)
-        log("")
+            # Rotate IPv6 for each account (except first, already rotated on start)
+            if rotator and i > 0:
+                log(f"  🎲 Rotacionando IPv6...")
+                await rotator.rotate()
+                log(f"  🌐 Novo IPv6: {rotator.current_ipv6}")
+
+            proxy_url = rotator.proxy_url if rotator else None
+
+            try:
+                token = await create_one_account(proxy_url=proxy_url)
+                if token:
+                    tokens.append(token)
+                    add_token_to_config(token)
+                    save_account(token, f"batch-{i+1}")
+                    expiry = decode_token_expiry(token)
+                    if expiry:
+                        exp_str = datetime.fromtimestamp(expiry, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                        log(f"  📅 Token expires: {exp_str}")
+                else:
+                    log("  ❌ Account creation failed")
+            except Exception as e:
+                log(f"  ❌ Exception: {type(e).__name__}: {e}")
+
+            if i < count - 1:
+                log(f"  ⏳ Waiting {delay_seconds}s before next account...")
+                await asyncio.sleep(delay_seconds)
+            log("")
+    finally:
+        if rotator:
+            log("🧹 Limpando IPv6 adicionados...")
+            await rotator.stop()
+            log("  ✅ Cleanup completo")
 
     log(f"━━━ Summary ━━━")
     log(f"  ✅ Created: {len(tokens)}/{count}")
@@ -583,25 +611,24 @@ def main():
     )
     parser.add_argument("--count", "-n", type=int, default=1, help="Number of accounts to create")
     parser.add_argument("--delay", "-d", type=float, default=10.0, help="Delay between accounts (seconds)")
-    parser.add_argument("--proxy", type=str, default=None, help="SOCKS5 proxy URL (e.g. socks5://127.0.0.1:40000)")
-    parser.add_argument("--no-ipv6", action="store_true", help="Disable IPv6 rotation hint")
+    parser.add_argument("--no-ipv6", action="store_true", help="Disable IPv6 rotation (use direct IP)")
 
     args = parser.parse_args()
 
     print("""
 ╔══════════════════════════════════════════╗
 ║     LMArena Account Creator              ║
-║     CloakBrowser + Auto Signup           ║
+║     CloakBrowser + IPv6 Rotation         ║
 ╚══════════════════════════════════════════╝
 """)
 
-    log(f"Config: count={args.count}, delay={args.delay}s, proxy={args.proxy or 'none'}")
+    log(f"Config: count={args.count}, delay={args.delay}s, ipv6={'off' if args.no_ipv6 else 'on'}")
     log("")
 
     tokens = asyncio.run(create_accounts(
         count=args.count,
         delay_seconds=args.delay,
-        proxy_url=args.proxy,
+        use_ipv6=not args.no_ipv6,
     ))
 
     sys.exit(0 if tokens else 1)
