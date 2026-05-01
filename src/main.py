@@ -2437,12 +2437,10 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
             else:
                 recaptcha_token = await refresh_recaptcha_token(force_new=False)
                 if not recaptcha_token:
-                    debug_print("❌ Cannot proceed, failed to get reCAPTCHA token.")
-                    raise HTTPException(
-                        status_code=503,
-                        detail="Service Unavailable: Failed to acquire reCAPTCHA token. The bridge server may be blocked."
-                    )
-                debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
+                    debug_print("⚠️ reCAPTCHA token unavailable, proceeding with empty token (backend may still accept).")
+                    recaptcha_token = ""
+                else:
+                    debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
         # -----------------------------------------------
         
         # Generate conversation ID from context (API key + model + first user message)
