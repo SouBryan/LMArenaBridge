@@ -597,11 +597,8 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
                 timeout=30000,
             )
 
-        # Small stabilization delay before execute
-        await asyncio.sleep(1)
-
-        token = await page.evaluate(
-            """({sitekey, action}) => new Promise((resolve, reject) => {
+        # Retry evaluate with delays — arena.ai SPA navigation can destroy context temporarily
+        mint_js = """({sitekey, action}) => new Promise((resolve, reject) => {
               const g = (window.grecaptcha?.enterprise && typeof window.grecaptcha.enterprise.execute === 'function')
                 ? window.grecaptcha.enterprise
                 : window.grecaptcha;
@@ -609,11 +606,29 @@ async def get_recaptcha_v3_token_with_chrome(config: dict) -> Optional[str]:
               try {
                 g.execute(sitekey, { action }).then(resolve).catch((err) => reject(String(err)));
               } catch (e) { reject(String(e)); }
-            })""",
-            {"sitekey": recaptcha_sitekey, "action": recaptcha_action},
-        )
-        if isinstance(token, str) and token:
-            return token
+            })"""
+        
+        token = None
+        for attempt in range(4):
+            await asyncio.sleep(2 + attempt * 2)  # 2s, 4s, 6s, 8s
+            try:
+                token = await page.evaluate(mint_js, {"sitekey": recaptcha_sitekey, "action": recaptcha_action})
+                if isinstance(token, str) and token:
+                    _m().debug_print(f"  ✅ Chrome reCAPTCHA token acquired (attempt {attempt + 1})")
+                    return token
+            except Exception as e:
+                _m().debug_print(f"  ⚠️ Chrome evaluate attempt {attempt + 1}/4 failed: {e}")
+                if attempt < 3:
+                    # Re-inject scripts in case context was destroyed
+                    try:
+                        await page.evaluate(f"""() => {{
+                            if (window.grecaptcha?.enterprise?.execute) return;
+                            const s = document.createElement('script');
+                            s.src = 'https://www.google.com/recaptcha/enterprise.js?render={recaptcha_sitekey}';
+                            document.head.appendChild(s);
+                        }}""")
+                    except Exception:
+                        pass
         return None
     except Exception as e:
         _m().debug_print(f"⚠️ Chrome reCAPTCHA retrieval failed: {e}")
