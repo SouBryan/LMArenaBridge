@@ -2432,15 +2432,14 @@ async def api_chat_completions(request: Request, api_key: dict = Depends(rate_li
         else:
             # reCAPTCHA v3 tokens can behave like single-use tokens; force a fresh token for streaming requests.
             # For streaming, we defer this until inside generate_stream to avoid blocking initial headers.
-            if stream:
-                recaptcha_token = ""
+            # For non-streaming: try cached token first; if unavailable, proceed with empty token
+            # (the backend/proxy accepts empty tokens and the proxy mints in-page).
+            recaptcha_token = get_cached_recaptcha_token()
+            if recaptcha_token:
+                debug_print(f"🔑 Using cached reCAPTCHA v3 token: {recaptcha_token[:20]}...")
             else:
-                recaptcha_token = await refresh_recaptcha_token(force_new=False)
-                if not recaptcha_token:
-                    debug_print("⚠️ reCAPTCHA token unavailable, proceeding with empty token (backend may still accept).")
-                    recaptcha_token = ""
-                else:
-                    debug_print(f"🔑 Using reCAPTCHA v3 token: {recaptcha_token[:20]}...")
+                debug_print("⚠️ No cached reCAPTCHA token, proceeding with empty token.")
+                recaptcha_token = ""
         # -----------------------------------------------
         
         # Generate conversation ID from context (API key + model + first user message)
